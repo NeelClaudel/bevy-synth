@@ -123,6 +123,9 @@ pub struct StereoDelay {
     /// One-pole state for the damping filter in each feedback path.
     damp_left: f32,
     damp_right: f32,
+
+    /// Tracks whether the delay is fully bypassed, to clear on transition.
+    bypassed: bool,
 }
 
 impl StereoDelay {
@@ -142,6 +145,7 @@ impl StereoDelay {
             damping: Smoothed::new(default.delay_damping, LEVEL_GLIDE_MS, control_rate),
             damp_left: 0.0,
             damp_right: 0.0,
+            bypassed: false,
         }
     }
 
@@ -156,6 +160,7 @@ impl StereoDelay {
         self.right.clear();
         self.damp_left = 0.0;
         self.damp_right = 0.0;
+        self.bypassed = false;
         self.set_targets(params, tempo_bpm);
         self.time.snap_to_target();
         self.mix.snap_to_target();
@@ -189,8 +194,16 @@ impl StereoDelay {
         // This is what makes a dry patch bit-identical, and it also means an
         // unused delay costs nothing per sample.
         if params.delay_mix == 0.0 && self.mix.value() == 0.0 {
+            if !self.bypassed {
+                self.left.clear();
+                self.right.clear();
+                self.damp_left = 0.0;
+                self.damp_right = 0.0;
+                self.bypassed = true;
+            }
             return;
         }
+        self.bypassed = false;
 
         self.set_targets(params, tempo_bpm);
 
@@ -216,7 +229,8 @@ impl StereoDelay {
             let dry_right = right[i];
 
             // The line is read before this sample is written, so reading one short of the
-            // delay time puts the repeat exactly `time_from / time_to` samples after the input.
+            // delay time puts the repeat exactly at the interpolated delay, which varies
+            // from `time_from` to `time_to` across the chunk.
             let wet_left = self.left.read_frac(time);
             let wet_right = self.right.read_frac(time);
 
@@ -443,5 +457,49 @@ mod tests {
             assert!(sample.is_finite(), "sample {i} was {sample}");
             assert!(sample.abs() < 40.0, "sample {i} was {sample}");
         }
+    }
+
+    #[test]
+    fn bypass_clears_tail_on_reenable() {
+        // Drive an impulse through the delay with feedback.
+        let mut params = Params::default();
+        params.delay_mix = 1.0;
+        params.delay_feedback = 0.5;
+        params.delay_time = 0.01; // 480 samples at 48 kHz
+        params.delay_damping = 0.0;
+
+        let mut delay = StereoDelay::new(SR);
+        delay.snap(&params, 120.0);
+
+        let mut left = vec![0.0; 6000];
+        let mut right = vec![0.0; 6000];
+        left[0] = 1.0;
+
+        // Run until the first repeat is clearly audible and fed back.
+        run(&mut delay, &mut left[..960], &mut right[..960], &params);
+        let first_repeat_amplitude = left[480].abs();
+        assert!(first_repeat_amplitude > 0.9, "first repeat: {}", first_repeat_amplitude);
+
+        // Now turn off the delay and run long enough for the mix smoother to
+        // settle and engage the early-out bypass.
+        params.delay_mix = 0.0;
+        run(&mut delay, &mut left[960..2960], &mut right[960..2960], &params);
+
+        // Re-enable the delay.
+        params.delay_mix = 1.0;
+        run(&mut delay, &mut left[2960..6000], &mut right[2960..6000], &params);
+
+        // The delay lines were cleared, so any signal here is fresh input (which
+        // is zero). No resurgent tail should appear.
+        let max_after_reenable = left[2960..]
+            .iter()
+            .copied()
+            .map(|x| x.abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_after_reenable < 0.01,
+            "resurgent tail after reenable: {}",
+            max_after_reenable
+        );
     }
 }
