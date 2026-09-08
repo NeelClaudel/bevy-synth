@@ -5,8 +5,9 @@ platform audio and MIDI stacks.
 
 Polyphonic or monophonic. Two band-limited oscillators, a sub and noise, into a
 state-variable filter with every response and real resonance. Two envelopes, an
-LFO, glide, drive. MIDI keyboard and MIDI clock. A step sequencer with a
-generative pattern writer that stays in key.
+LFO, glide, drive. A tempo-syncable stereo delay into a plate reverb, stereo
+out. MIDI keyboard and MIDI clock. A step sequencer with a generative pattern
+writer that stays in key.
 
 ## The one thing to understand
 
@@ -147,6 +148,7 @@ than from running two reverbs side by side.
 | 12 / 24 dB slope | `filter.rs` | Two SVFs in series; the second gets half the resonance, or the peaks multiply into a howl. |
 | Envelopes | `env.rs` | Exponential ADSR, one for amplitude and one for the filter. Times in seconds, so patches survive a sample-rate change. |
 | LFO | `lfo.rs` | Six shapes including sample-and-hold and smoothed random. Routes to cutoff, pitch, amplitude or pulse width. |
+| Delay and reverb | `fx/` | A tempo-syncable stereo delay into a Dattorro plate reverb, in that order so the reverb hears the repeats. Both hard-bypass at zero mix, so a dry patch comes out bit-identical. |
 | MIDI keyboard | `synth_audio/midi.rs` | Notes, velocity, pitch bend, mod wheel, all-notes-off. Bypasses the ECS — hardware input should not wait for a frame. |
 | MIDI clock | `clock.rs` | 24 PPQN, with Start/Stop/Continue. Estimates the incoming tempo from tick spacing and ignores implausible gaps. |
 | Sequencer | `sequencer.rs` | Sample-accurate to within one 32-sample block (~0.7 ms), with per-step gate length and swing. |
