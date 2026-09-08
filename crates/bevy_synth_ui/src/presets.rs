@@ -9,7 +9,7 @@
 //! # What a preset does and does not touch
 //!
 //! Presets set the *patch*: oscillators, filter, envelopes, LFO, voice mode,
-//! output. They deliberately leave the sequencer and generator alone — tempo,
+//! output, and effects. They deliberately leave the sequencer and generator alone — tempo,
 //! key, scale and pattern length belong to the piece you are writing, not to
 //! the sound, and having them reset every time you auditioned a patch would be
 //! infuriating.
@@ -21,7 +21,7 @@ use bevy_synth::Synth;
 use synth_core::filter::{Slope, SvfMode};
 use synth_core::lfo::{LfoTarget, LfoWave};
 use synth_core::params::{SharedParams, VoiceMode};
-use synth_core::Waveform;
+use synth_core::{NoteDivision, Waveform};
 
 use crate::widgets::{self, palette};
 
@@ -153,6 +153,20 @@ fn reset(p: &SharedParams) {
 
     p.drive.set(1.0);
     p.master_gain.set(0.5);
+
+    p.delay_mix.set(0.0);
+    p.delay_sync.set(false);
+    p.delay_time.set(0.375);
+    p.delay_division.set(NoteDivision::Eighth as u32);
+    p.delay_feedback.set(0.35);
+    p.delay_damping.set(0.3);
+    p.delay_ping_pong.set(false);
+
+    p.reverb_mix.set(0.0);
+    p.reverb_size.set(0.5);
+    p.reverb_damping.set(0.5);
+    p.reverb_predelay.set(0.02);
+    p.reverb_width.set(1.0);
 }
 
 fn init(p: &SharedParams) {
@@ -185,6 +199,16 @@ fn warm_pad(p: &SharedParams) {
     p.lfo_depth.set(0.3);
 
     p.master_gain.set(0.35);
+
+    p.reverb_mix.set(0.4);
+    p.reverb_size.set(0.8);
+    p.reverb_damping.set(0.45);
+    p.reverb_predelay.set(0.035);
+    p.delay_mix.set(0.15);
+    p.delay_sync.set(true);
+    p.delay_division.set(NoteDivision::Quarter as u32);
+    p.delay_feedback.set(0.3);
+    p.delay_damping.set(0.6);
 }
 
 fn acid_bass(p: &SharedParams) {
@@ -233,6 +257,15 @@ fn pluck(p: &SharedParams) {
 
     p.filter_velocity.set(0.6);
     p.master_gain.set(0.5);
+
+    p.delay_mix.set(0.35);
+    p.delay_sync.set(true);
+    p.delay_division.set(NoteDivision::Eighth as u32);
+    p.delay_feedback.set(0.45);
+    p.delay_damping.set(0.4);
+    p.delay_ping_pong.set(true);
+    p.reverb_mix.set(0.18);
+    p.reverb_size.set(0.55);
 }
 
 fn brass(p: &SharedParams) {
@@ -284,6 +317,12 @@ fn glass_bell(p: &SharedParams) {
     p.amp_release.set(2.0);
 
     p.master_gain.set(0.45);
+
+    p.reverb_mix.set(0.45);
+    p.reverb_size.set(0.85);
+    p.reverb_damping.set(0.2);
+    p.reverb_predelay.set(0.01);
+    p.reverb_width.set(1.0);
 }
 
 fn sub_bass(p: &SharedParams) {
@@ -334,6 +373,11 @@ fn wind(p: &SharedParams) {
     p.lfo_depth.set(0.5);
 
     p.master_gain.set(0.4);
+
+    p.reverb_mix.set(0.55);
+    p.reverb_size.set(0.95);
+    p.reverb_damping.set(0.35);
+    p.reverb_predelay.set(0.05);
 }
 
 #[cfg(test)]
@@ -410,5 +454,62 @@ mod tests {
         assert_eq!(params.tempo.get(), 174.0);
         assert_eq!(params.gen_root.get(), 7);
         assert_eq!(params.seq_length.get(), 32);
+    }
+
+    #[test]
+    fn effects_do_not_leak_between_presets() {
+        use synth_core::params::Params;
+
+        let params = SharedParams::from_params(&Params::default());
+
+        // A thoroughly wet patch.
+        params.delay_mix.set(0.9);
+        params.delay_sync.set(true);
+        params.delay_time.set(1.5);
+        params.delay_division.set(NoteDivision::Whole as u32);
+        params.delay_feedback.set(0.9);
+        params.delay_damping.set(0.9);
+        params.delay_ping_pong.set(true);
+        params.reverb_mix.set(0.9);
+        params.reverb_size.set(0.99);
+        params.reverb_damping.set(0.9);
+        params.reverb_predelay.set(0.2);
+        params.reverb_width.set(0.1);
+
+        // Init is the dry one. Loading it must leave nothing behind, or the
+        // synth quietly sounds different depending on what you loaded before.
+        let init = ALL.iter().find(|p| p.name == "Init").unwrap();
+        (init.apply)(&params);
+
+        let defaults = Params::default();
+        let after = params.snapshot();
+        assert_eq!(after.delay_mix, defaults.delay_mix);
+        assert_eq!(after.delay_sync, defaults.delay_sync);
+        assert_eq!(after.delay_time, defaults.delay_time);
+        assert_eq!(after.delay_division, defaults.delay_division);
+        assert_eq!(after.delay_feedback, defaults.delay_feedback);
+        assert_eq!(after.delay_damping, defaults.delay_damping);
+        assert_eq!(after.delay_ping_pong, defaults.delay_ping_pong);
+        assert_eq!(after.reverb_mix, defaults.reverb_mix);
+        assert_eq!(after.reverb_size, defaults.reverb_size);
+        assert_eq!(after.reverb_damping, defaults.reverb_damping);
+        assert_eq!(after.reverb_predelay, defaults.reverb_predelay);
+        assert_eq!(after.reverb_width, defaults.reverb_width);
+    }
+
+    #[test]
+    fn some_presets_use_the_effects() {
+        use synth_core::params::Params;
+
+        let params = SharedParams::from_params(&Params::default());
+        let wet = ALL
+            .iter()
+            .filter(|preset| {
+                (preset.apply)(&params);
+                let p = params.snapshot();
+                p.delay_mix > 0.0 || p.reverb_mix > 0.0
+            })
+            .count();
+        assert!(wet >= 3, "only {wet} presets use the effects");
     }
 }
