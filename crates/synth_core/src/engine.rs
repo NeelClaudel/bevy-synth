@@ -279,8 +279,12 @@ impl Engine {
             // signal by roughly 7x at extreme settings (full delay feedback
             // and reverb size), so this is the only thing standing between
             // that and the device, and at those settings it clips hard rather
-            // than soft. Known behaviour, not a bug — see I2 in the branch
-            // review for the measurements.
+            // than soft: with `delay_mix` 1.0, `delay_feedback` 0.9,
+            // `reverb_mix` 1.0 and `reverb_size` 1.0, about two thirds of
+            // output samples sit pinned at exactly ±1.0. Known behaviour, not
+            // a bug — the loudest shipping preset asks for 0.55, and moving
+            // the saturation downstream of the effects would change the dry
+            // path too.
             let l = if l.is_finite() { l.clamp(-1.0, 1.0) } else { 0.0 };
             let r = if r.is_finite() { r.clamp(-1.0, 1.0) } else { 0.0 };
             self.peak = self.peak.max(l.abs()).max(r.abs());
