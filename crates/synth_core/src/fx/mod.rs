@@ -2,6 +2,8 @@
 
 mod delay;
 mod line;
+mod reverb;
 
 pub use delay::{NoteDivision, StereoDelay};
 pub use line::DelayLine;
+pub use reverb::PlateReverb;
