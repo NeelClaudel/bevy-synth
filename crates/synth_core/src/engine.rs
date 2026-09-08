@@ -899,4 +899,61 @@ mod tests {
         }
         assert!(peak(&stereo) > 0.0);
     }
+
+    /// FNV-1a over the raw bits of every sample.
+    ///
+    /// A checksum rather than a stored buffer because 4096 floats do not
+    /// belong in a source file, and because the bits are what matter: any
+    /// change to any sample, however small, changes the hash.
+    fn bit_hash(samples: &[f32]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for sample in samples {
+            for byte in sample.to_bits().to_le_bytes() {
+                h ^= byte as u64;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        h
+    }
+
+    /// Renders the reference signal: one held middle C, sequencer off,
+    /// everything else at its default. Deterministic and dry.
+    fn golden_render() -> Vec<f32> {
+        let (mut e, tx, params) = engine();
+        params.seq_playing.set(false);
+        tx.push(Event::NoteOn {
+            note: 60,
+            velocity: 0.8,
+        });
+        render(&mut e, 4096)
+    }
+
+    /// The hash of the reference signal, and a readable window into it.
+    ///
+    /// The effects stage sits between the DC blocker and the master gain, and
+    /// it must be inaudible when both mixes are zero. "Inaudible" is not good
+    /// enough here — the dry path has to come out bit for bit identical, or
+    /// every existing patch has quietly changed. The window makes a failure
+    /// diagnosable: the hash tells you something moved, the sixteen samples
+    /// tell you by how much.
+    const GOLDEN_HASH: u64 = 0x1c357a5698234b39;
+    const GOLDEN_WINDOW: [u32; 16] = [0xbe1e6c64, 0xbe1a2c83, 0xbe15e73a, 0xbe119c18, 0xbe0d4af2, 0xbe08f415, 0xbe049826, 0xbe0037d3, 0xbdf7a754, 0xbdeed81e, 0xbde60286, 0xbddd26f3, 0xbdd445b6, 0xbdcb5f25, 0xbdc2739a, 0xbdb9836e];
+
+    #[test]
+    fn the_dry_path_matches_the_golden_vector() {
+        let out = golden_render();
+        let window: Vec<u32> = out[2048..2064].iter().map(|s| s.to_bits()).collect();
+        let hash = bit_hash(&out);
+
+        if hash != GOLDEN_HASH || window[..] != GOLDEN_WINDOW[..] {
+            let listed: Vec<String> = window.iter().map(|b| format!("0x{b:08x}")).collect();
+            panic!(
+                "dry output changed.\n\
+                 const GOLDEN_HASH: u64 = 0x{hash:016x};\n\
+                 const GOLDEN_WINDOW: [u32; 16] = [{}];\n\
+                 (If this is the first run, paste the two lines above into the test.)",
+                listed.join(", ")
+            );
+        }
+    }
 }
