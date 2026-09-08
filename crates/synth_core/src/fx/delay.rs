@@ -91,7 +91,7 @@ impl NoteDivision {
     }
 }
 
-use crate::fx::line::DelayLine;
+use crate::fx::line::{flush, DelayLine};
 use crate::params::{Params, Smoothed};
 use crate::BLOCK;
 
@@ -239,6 +239,11 @@ impl StereoDelay {
             // which is how a real echo behaves.
             self.damp_left += damp_coefficient * (wet_left - self.damp_left);
             self.damp_right += damp_coefficient * (wet_right - self.damp_right);
+            // No measured cost today (the delay has no dense recirculating
+            // lattice to sustain a denormal), but flush anyway so the
+            // convention stays uniform across `fx/` rather than half-applied.
+            self.damp_left = flush(self.damp_left);
+            self.damp_right = flush(self.damp_right);
 
             if params.delay_ping_pong {
                 // Cross both the input and the feedback, so a sound entering

@@ -7,7 +7,7 @@
 //! through both halves, turn the single mono tank into a stereo output. That
 //! is where the width comes from — not from running two reverbs.
 
-use crate::fx::line::DelayLine;
+use crate::fx::line::{flush, DelayLine};
 use crate::params::{Params, Smoothed};
 use crate::BLOCK;
 
@@ -162,6 +162,12 @@ pub struct PlateReverb {
 
     mod_phase: f32,
     mod_increment: f32,
+    /// The right half's modulator gets its own accumulator rather than
+    /// scaling the left's wrapped angle: scaling after the wrap turns the
+    /// wrap into a discontinuity instead of a second sinusoid at a related
+    /// rate. See `MOD_HZ_RATIO`.
+    mod_phase_r: f32,
+    mod_increment_r: f32,
     excursion: f32,
 
     taps: Taps,
@@ -246,6 +252,8 @@ impl PlateReverb {
             node_r: 0.0,
             mod_phase: 0.0,
             mod_increment: MOD_HZ / sample_rate,
+            mod_phase_r: 0.0,
+            mod_increment_r: MOD_HZ * MOD_HZ_RATIO / sample_rate,
             excursion,
             taps,
             mix: Smoothed::new(default.reverb_mix, GLIDE_MS, control_rate),
@@ -288,6 +296,7 @@ impl PlateReverb {
         self.node_l = 0.0;
         self.node_r = 0.0;
         self.mod_phase = 0.0;
+        self.mod_phase_r = 0.0;
     }
 
     /// Empties the tank and jumps every smoother to its target.
@@ -352,6 +361,7 @@ impl PlateReverb {
             let delayed = self.predelay.read_frac(predelay);
 
             self.bandwidth_state += INPUT_BANDWIDTH * (delayed - self.bandwidth_state);
+            self.bandwidth_state = flush(self.bandwidth_state);
             let mut diffused = self.bandwidth_state;
             for (diffuser, &coefficient) in
                 self.diffusers.iter_mut().zip(DIFFUSER_COEFFICIENTS.iter())
@@ -367,15 +377,24 @@ impl PlateReverb {
             if self.mod_phase >= 1.0 {
                 self.mod_phase -= 1.0;
             }
-            let angle = self.mod_phase * std::f32::consts::TAU;
-            let excursion_l = angle.sin() * self.excursion;
-            let excursion_r = (angle * MOD_HZ_RATIO).sin() * self.excursion;
+            let excursion_l = (self.mod_phase * std::f32::consts::TAU).sin() * self.excursion;
+
+            // Its own accumulator, wrapping independently, rather than
+            // scaling the left phase's angle after the wrap: that would turn
+            // every wrap of `mod_phase` into a discontinuity in this channel
+            // instead of a second LFO at MOD_HZ_RATIO times the rate.
+            self.mod_phase_r += self.mod_increment_r;
+            if self.mod_phase_r >= 1.0 {
+                self.mod_phase_r -= 1.0;
+            }
+            let excursion_r = (self.mod_phase_r * std::f32::consts::TAU).sin() * self.excursion;
 
             let mut half_l = self
                 .ap_l1
                 .process_modulated(diffused + feed_r, TANK_DIFFUSION_1, excursion_l);
             half_l = self.delay_l1.process(half_l);
             self.damp_l += (1.0 - damp_keep) * (half_l - self.damp_l);
+            self.damp_l = flush(self.damp_l);
             half_l = self.ap_l2.process(self.damp_l * decay, tank_diffusion_2);
             let out_l = self.delay_l2.process(half_l);
 
@@ -384,11 +403,12 @@ impl PlateReverb {
                 .process_modulated(diffused + feed_l, TANK_DIFFUSION_1, excursion_r);
             half_r = self.delay_r1.process(half_r);
             self.damp_r += (1.0 - damp_keep) * (half_r - self.damp_r);
+            self.damp_r = flush(self.damp_r);
             half_r = self.ap_r2.process(self.damp_r * decay, tank_diffusion_2);
             let out_r = self.delay_r2.process(half_r);
 
-            self.node_l = out_l * decay;
-            self.node_r = out_r * decay;
+            self.node_l = flush(out_l * decay);
+            self.node_r = flush(out_r * decay);
 
             let tap_left = 0.6
                 * (self.delay_r1.tap(self.taps.left[0]) + self.delay_r1.tap(self.taps.left[1])
@@ -443,6 +463,31 @@ mod tests {
         params.reverb_predelay = 0.0;
         params.reverb_width = 1.0;
         params
+    }
+
+    /// Peak absolute value across every piece of the tank's persistent
+    /// state: the pre-delay, the four input diffusers, the eight tank
+    /// delay/all-pass lines, and the five scalar states that sit outside
+    /// them (`bandwidth_state`, `damp_l`, `damp_r`, `node_l`, `node_r`).
+    /// Test-only, for asserting the tank reaches exact zero rather than
+    /// merely "small" after a denormal flush.
+    fn peak_state(reverb: &PlateReverb) -> f32 {
+        let mut peak = reverb.bandwidth_state.abs();
+        peak = peak.max(reverb.damp_l.abs()).max(reverb.damp_r.abs());
+        peak = peak.max(reverb.node_l.abs()).max(reverb.node_r.abs());
+        peak = peak.max(reverb.predelay.peak_abs());
+        for diffuser in &reverb.diffusers {
+            peak = peak.max(diffuser.line.peak_abs());
+        }
+        peak = peak.max(reverb.ap_l1.line.peak_abs());
+        peak = peak.max(reverb.delay_l1.line.peak_abs());
+        peak = peak.max(reverb.ap_l2.line.peak_abs());
+        peak = peak.max(reverb.delay_l2.line.peak_abs());
+        peak = peak.max(reverb.ap_r1.line.peak_abs());
+        peak = peak.max(reverb.delay_r1.line.peak_abs());
+        peak = peak.max(reverb.ap_r2.line.peak_abs());
+        peak = peak.max(reverb.delay_r2.line.peak_abs());
+        peak
     }
 
     /// Root mean square of a window, which is how loud it actually is.
@@ -642,5 +687,51 @@ mod tests {
         {
             assert_eq!(*sample, 0.0, "resurgent tail after reenable at {i}: {sample}");
         }
+    }
+
+    #[test]
+    fn silence_flushes_the_tank_state_to_exact_zero() {
+        // C1: without a flush, the tank's recirculating state decays into
+        // the subnormal range and settles at a stable non-zero fixed point
+        // (measured at 6e-45, one ULP above zero) instead of continuing to
+        // underflow to 0.0.
+        //
+        // At `decay_for(0.9)` == 0.875, the state needs roughly 344 laps of
+        // the tank's ~25000-sample loop (about 170 s of simulated audio) to
+        // cross the 1e-20 flush threshold, and the review's own timing runs
+        // showed the unflushed tank reaching its stuck fixed point by the
+        // ~180-200 s mark and staying there through the rest of a 10-minute
+        // run. 210 s gives margin past that without paying for the full
+        // ~4 minutes the review suggests as a starting point -- this is
+        // simulated audio processed as fast as the CPU allows, so it costs
+        // milliseconds of wall-clock time rather than the 210 s it
+        // represents.
+        let params = wet(1.0, 0.9, 0.1);
+        let mut reverb = PlateReverb::new(SR);
+        reverb.snap(&params);
+
+        // Excite the tank so there is something to decay.
+        let excite = (SR * 0.1) as usize;
+        let mut left = vec![0.0; excite];
+        let mut right = vec![0.0; excite];
+        left[0] = 1.0;
+        right[0] = 1.0;
+        run(&mut reverb, &mut left, &mut right, &params);
+        assert!(peak_state(&reverb) > 0.0, "tank was never excited");
+
+        // Then silence, streamed block by block rather than allocated as one
+        // giant buffer, long enough to cross the flush threshold and, absent
+        // the fix, reach the stuck denormal fixed point.
+        let silent_block_l = [0.0f32; crate::BLOCK];
+        let silent_block_r = [0.0f32; crate::BLOCK];
+        let blocks = ((SR * 210.0) / crate::BLOCK as f32).ceil() as usize;
+        for _ in 0..blocks {
+            let mut l = silent_block_l;
+            let mut r = silent_block_r;
+            reverb.process_chunk(&mut l, &mut r, &params);
+        }
+
+        let peak = peak_state(&reverb);
+        assert_eq!(peak, 0.0, "tank state stuck at {peak} after 210 s of silence");
     }
 }

@@ -4,6 +4,20 @@
 //! power of two so the wrap is a bitmask rather than a modulo or a branch —
 //! this runs once per sample per line, and the reverb has ten of them.
 
+/// Denormals cost up to 100x on some CPUs, and a recirculating feedback path
+/// — which is what every delay line in `fx/` ultimately is — produces them
+/// constantly on the way to zero, sometimes settling into a subnormal fixed
+/// point that never reaches zero on its own. Flush to zero, matching the
+/// convention in `filter.rs`.
+#[inline]
+pub(crate) fn flush(x: f32) -> f32 {
+    if x.abs() < 1e-20 {
+        0.0
+    } else {
+        x
+    }
+}
+
 /// A delay line with integer and fractional reads.
 ///
 /// The convention throughout: `read(0)` returns the sample most recently
@@ -44,7 +58,10 @@ impl DelayLine {
 
     #[inline]
     pub fn write(&mut self, value: f32) {
-        self.buffer[self.write] = value;
+        // Every delay line in both effects funnels through here, so flushing
+        // at this single point closes the whole family at once: the tank
+        // delays, the all-passes, the diffusers, the pre-delay.
+        self.buffer[self.write] = flush(value);
         self.write = (self.write + 1) & self.mask;
     }
 
@@ -80,6 +97,16 @@ impl DelayLine {
         let a = self.read(index);
         let b = self.read(index + 1);
         a + (b - a) * frac
+    }
+}
+
+#[cfg(test)]
+impl DelayLine {
+    /// Peak absolute value currently stored in the line. Test-only: lets the
+    /// denormal-flush regression test in `reverb.rs` see past a `PlateReverb`
+    /// with no other public window into its recirculating state.
+    pub(crate) fn peak_abs(&self) -> f32 {
+        self.buffer.iter().fold(0.0_f32, |peak, &x| peak.max(x.abs()))
     }
 }
 

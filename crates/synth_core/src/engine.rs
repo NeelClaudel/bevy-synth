@@ -249,6 +249,12 @@ impl Engine {
             // clean.
             let driven = soft_clip(self.block[i] * params.drive);
             let blocked = driven - self.dc_x1 + self.dc_coef * self.dc_y1;
+            // Guard here, before the effects, not just at the output: the
+            // delay lines and the reverb tank recirculate whatever they're
+            // fed, so a non-finite sample stored there is poisoned forever,
+            // and the downstream guard can only clean state that was never
+            // written in the first place.
+            let blocked = if blocked.is_finite() { blocked } else { 0.0 };
             self.dc_x1 = driven;
             self.dc_y1 = blocked;
             left[i] = blocked;
@@ -266,6 +272,15 @@ impl Engine {
             let r = right[i] * gain;
             // A NaN reaching the driver is a loud, ugly failure. It should be
             // impossible, but silence is the right answer if it ever happens.
+            //
+            // This clamp is hard, not soft: `soft_clip` runs upstream, before
+            // the DC blocker and the effects, so it saturates only the dry
+            // voices and never sees the wet signal. The effects can gain the
+            // signal by roughly 7x at extreme settings (full delay feedback
+            // and reverb size), so this is the only thing standing between
+            // that and the device, and at those settings it clips hard rather
+            // than soft. Known behaviour, not a bug — see I2 in the branch
+            // review for the measurements.
             let l = if l.is_finite() { l.clamp(-1.0, 1.0) } else { 0.0 };
             let r = if r.is_finite() { r.clamp(-1.0, 1.0) } else { 0.0 };
             self.peak = self.peak.max(l.abs()).max(r.abs());
