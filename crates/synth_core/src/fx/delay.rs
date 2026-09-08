@@ -157,14 +157,10 @@ impl StereoDelay {
         self.damp_left = 0.0;
         self.damp_right = 0.0;
         self.set_targets(params, tempo_bpm);
-        let time_target = self.time.value();
-        self.time.snap(time_target);
-        let mix_target = self.mix.value();
-        self.mix.snap(mix_target);
-        let feedback_target = self.feedback.value();
-        self.feedback.snap(feedback_target);
-        let damping_target = self.damping.value();
-        self.damping.snap(damping_target);
+        self.time.snap_to_target();
+        self.mix.snap_to_target();
+        self.feedback.snap_to_target();
+        self.damping.snap_to_target();
     }
 
     fn set_targets(&mut self, params: &Params, tempo_bpm: f32) {

@@ -215,6 +215,14 @@ impl Smoothed {
         self.target = value;
     }
 
+    /// Jumps straight to wherever `set_target` last pointed, with no ramp.
+    /// For the effects, whose targets are computed from the patch rather than
+    /// known to the caller.
+    #[inline]
+    pub fn snap_to_target(&mut self) {
+        self.value = self.target;
+    }
+
     #[inline]
     pub fn value(&self) -> f32 {
         self.value
