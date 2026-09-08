@@ -64,12 +64,15 @@ impl DelayLine {
     /// Linear interpolation, not something higher order: it costs one multiply
     /// and its high-frequency loss is a mild darkening of the repeats, which is
     /// what a tape delay does anyway.
+    ///
+    /// Delay values are clamped toward the oldest history: infinity clamps to
+    /// `mask`, negative infinity to 0, and NaN to 0 (the newest sample).
     #[inline]
     pub fn read_frac(&self, delay: f32) -> f32 {
-        let delay = if delay.is_finite() {
-            delay.clamp(0.0, self.mask as f32)
-        } else {
+        let delay = if delay.is_nan() {
             0.0
+        } else {
+            delay.clamp(0.0, self.mask as f32)
         };
         let index = delay.floor();
         let frac = delay - index;
@@ -143,6 +146,24 @@ mod tests {
         assert_eq!(line.read(100_000), oldest);
         assert_eq!(line.read_frac(1.0e9), oldest);
         assert_eq!(line.read_frac(-5.0), line.read(0));
+    }
+
+    #[test]
+    fn a_fractional_read_with_non_finite_values_clamps_consistently() {
+        let mut line = DelayLine::new(8);
+        let capacity = line.capacity();
+        // Write distinguishable values so tests can't accidentally pass on equal samples.
+        for i in 0..capacity {
+            line.write((i as f32) * 10.0);
+        }
+        let newest = line.read(0);
+        let oldest = line.read(capacity - 1);
+        // Positive infinity should clamp to the oldest sample, not to newest.
+        assert_eq!(line.read_frac(f32::INFINITY), oldest);
+        // Negative infinity should clamp to the newest sample.
+        assert_eq!(line.read_frac(f32::NEG_INFINITY), newest);
+        // NaN should clamp to the newest sample and not propagate.
+        assert_eq!(line.read_frac(f32::NAN), newest);
     }
 
     #[test]
