@@ -91,6 +91,159 @@ impl NoteDivision {
     }
 }
 
+use crate::fx::line::DelayLine;
+use crate::params::{Params, Smoothed};
+use crate::BLOCK;
+
+/// Longest delay the lines are sized for, matching the parameter's range.
+const MAX_DELAY_SECONDS: f32 = 2.0;
+/// Shortest usable delay. Below about a millisecond this stops being a delay
+/// and starts being a comb filter.
+const MIN_DELAY_SECONDS: f32 = 0.001;
+/// How fast the delay time chases a new setting. Slow on purpose: this is what
+/// gives the tape-style pitch glide when you turn the time knob.
+const TIME_GLIDE_MS: f32 = 120.0;
+/// Everything else settles quickly — long enough to kill the zipper, short
+/// enough that the knob feels connected.
+const LEVEL_GLIDE_MS: f32 = 20.0;
+
+/// Two delay lines with a shared time, damped feedback and optional crossing.
+pub struct StereoDelay {
+    left: DelayLine,
+    right: DelayLine,
+    sample_rate: f32,
+
+    /// Delay time in samples. Smoothed, then linearly interpolated across the
+    /// chunk, because a step in the read position is an audible click.
+    time: Smoothed,
+    mix: Smoothed,
+    feedback: Smoothed,
+    damping: Smoothed,
+
+    /// One-pole state for the damping filter in each feedback path.
+    damp_left: f32,
+    damp_right: f32,
+}
+
+impl StereoDelay {
+    /// Not real-time safe: allocates both lines.
+    pub fn new(sample_rate: f32) -> Self {
+        let sample_rate = if sample_rate > 0.0 { sample_rate } else { 48000.0 };
+        let control_rate = sample_rate / BLOCK as f32;
+        let max_samples = (MAX_DELAY_SECONDS * sample_rate).ceil() as usize;
+        let default = Params::default();
+        Self {
+            left: DelayLine::new(max_samples),
+            right: DelayLine::new(max_samples),
+            sample_rate,
+            time: Smoothed::new(default.delay_time * sample_rate, TIME_GLIDE_MS, control_rate),
+            mix: Smoothed::new(default.delay_mix, LEVEL_GLIDE_MS, control_rate),
+            feedback: Smoothed::new(default.delay_feedback, LEVEL_GLIDE_MS, control_rate),
+            damping: Smoothed::new(default.delay_damping, LEVEL_GLIDE_MS, control_rate),
+            damp_left: 0.0,
+            damp_right: 0.0,
+        }
+    }
+
+    /// Jumps every smoother to where the parameters say it should be and
+    /// empties the lines.
+    ///
+    /// Used at startup and whenever the sample rate changes: gliding up from
+    /// whatever the previous patch happened to leave behind would be an audible
+    /// artefact nobody asked for.
+    pub fn snap(&mut self, params: &Params, tempo_bpm: f32) {
+        self.left.clear();
+        self.right.clear();
+        self.damp_left = 0.0;
+        self.damp_right = 0.0;
+        self.set_targets(params, tempo_bpm);
+        let time_target = self.time.value();
+        self.time.snap(time_target);
+        let mix_target = self.mix.value();
+        self.mix.snap(mix_target);
+        let feedback_target = self.feedback.value();
+        self.feedback.snap(feedback_target);
+        let damping_target = self.damping.value();
+        self.damping.snap(damping_target);
+    }
+
+    fn set_targets(&mut self, params: &Params, tempo_bpm: f32) {
+        let seconds = if params.delay_sync {
+            params.delay_division.seconds(tempo_bpm)
+        } else {
+            params.delay_time
+        };
+        let samples = seconds.clamp(MIN_DELAY_SECONDS, MAX_DELAY_SECONDS) * self.sample_rate;
+        let ceiling = (self.left.capacity() - 1) as f32;
+        self.time.set_target(samples.clamp(1.0, ceiling));
+        self.mix.set_target(params.delay_mix);
+        self.feedback.set_target(params.delay_feedback);
+        self.damping.set_target(params.delay_damping);
+    }
+
+    /// Processes up to `BLOCK` samples in place, advancing smoothing once.
+    pub fn process_chunk(
+        &mut self,
+        left: &mut [f32],
+        right: &mut [f32],
+        params: &Params,
+        tempo_bpm: f32,
+    ) {
+        // Fully off: skip the work entirely rather than multiplying by zero.
+        // This is what makes a dry patch bit-identical, and it also means an
+        // unused delay costs nothing per sample.
+        if params.delay_mix == 0.0 && self.mix.value() == 0.0 {
+            return;
+        }
+
+        self.set_targets(params, tempo_bpm);
+
+        let time_from = self.time.value();
+        let time_to = self.time.next();
+        let mix = self.mix.next();
+        let feedback = self.feedback.next();
+        let damping = self.damping.next();
+        // 1.0 is a wire, 0.05 is a heavily muffled repeat. Never 0.0: that
+        // would freeze the filter and mute the feedback path outright.
+        let damp_coefficient = 1.0 - damping * 0.95;
+
+        let count = left.len().min(right.len());
+        let step = if count > 1 {
+            (time_to - time_from) / (count - 1) as f32
+        } else {
+            0.0
+        };
+
+        for i in 0..count {
+            let time = time_from + step * i as f32;
+            let dry_left = left[i];
+            let dry_right = right[i];
+
+            let wet_left = self.left.read_frac(time);
+            let wet_right = self.right.read_frac(time);
+
+            // Damp what goes back round the loop, not what comes out: the
+            // first repeat stays bright and each one after it gets darker,
+            // which is how a real echo behaves.
+            self.damp_left += damp_coefficient * (wet_left - self.damp_left);
+            self.damp_right += damp_coefficient * (wet_right - self.damp_right);
+
+            if params.delay_ping_pong {
+                // Cross both the input and the feedback, so a sound entering
+                // on the left first reappears on the right, then the left.
+                self.left.write(dry_right + self.damp_right * feedback);
+                self.right.write(dry_left + self.damp_left * feedback);
+            } else {
+                self.left.write(dry_left + self.damp_left * feedback);
+                self.right.write(dry_right + self.damp_right * feedback);
+            }
+
+            left[i] = dry_left + (wet_left - dry_left) * mix;
+            right[i] = dry_right + (wet_right - dry_right) * mix;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,5 +292,158 @@ mod tests {
         // Out of range falls back rather than panicking: the value came across
         // an atomic from another thread and cannot be trusted.
         assert_eq!(NoteDivision::from_u32(999), NoteDivision::Eighth);
+    }
+
+    use crate::params::Params;
+
+    const SR: f32 = 48000.0;
+
+    /// Runs a delay over a buffer of any length, in `BLOCK`-sized chunks, the
+    /// way `FxChain` will.
+    fn run(delay: &mut StereoDelay, left: &mut [f32], right: &mut [f32], params: &Params) {
+        for (l, r) in left
+            .chunks_mut(crate::BLOCK)
+            .zip(right.chunks_mut(crate::BLOCK))
+        {
+            delay.process_chunk(l, r, params, 120.0);
+        }
+    }
+
+    #[test]
+    fn a_zero_mix_leaves_the_signal_bit_identical() {
+        let mut delay = StereoDelay::new(SR);
+        let params = Params::default();
+        delay.snap(&params, 120.0);
+
+        let source: Vec<f32> = (0..512).map(|i| (i as f32 * 0.01).sin()).collect();
+        let mut left = source.clone();
+        let mut right = source.clone();
+        run(&mut delay, &mut left, &mut right, &params);
+
+        // Not "close enough": identical. A dry patch must be untouched.
+        assert_eq!(left, source);
+        assert_eq!(right, source);
+    }
+
+    #[test]
+    fn an_impulse_comes_back_at_the_configured_time() {
+        let mut params = Params::default();
+        params.delay_mix = 1.0;
+        params.delay_feedback = 0.0;
+        params.delay_time = 0.01; // 480 samples at 48 kHz
+        params.delay_damping = 0.0;
+
+        let mut delay = StereoDelay::new(SR);
+        delay.snap(&params, 120.0);
+
+        let mut left = vec![0.0; 2048];
+        let mut right = vec![0.0; 2048];
+        left[0] = 1.0;
+        right[0] = 1.0;
+        run(&mut delay, &mut left, &mut right, &params);
+
+        let loudest = left
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+            .map(|(i, _)| i)
+            .unwrap();
+        assert_eq!(loudest, 480, "repeat landed at {loudest}");
+        assert!((left[480] - 1.0).abs() < 1e-6);
+        // With no feedback there is exactly one repeat.
+        assert!(left[960].abs() < 1e-6);
+    }
+
+    #[test]
+    fn feedback_halves_each_repeat() {
+        let mut params = Params::default();
+        params.delay_mix = 1.0;
+        params.delay_feedback = 0.5;
+        params.delay_time = 0.01;
+        params.delay_damping = 0.0;
+
+        let mut delay = StereoDelay::new(SR);
+        delay.snap(&params, 120.0);
+
+        let mut left = vec![0.0; 4096];
+        let mut right = vec![0.0; 4096];
+        left[0] = 1.0;
+        run(&mut delay, &mut left, &mut right, &params);
+
+        assert!((left[480] - 1.0).abs() < 1e-4, "first: {}", left[480]);
+        assert!((left[960] - 0.5).abs() < 1e-4, "second: {}", left[960]);
+        assert!((left[1440] - 0.25).abs() < 1e-4, "third: {}", left[1440]);
+    }
+
+    #[test]
+    fn ping_pong_bounces_the_repeats_between_the_channels() {
+        let mut params = Params::default();
+        params.delay_mix = 1.0;
+        params.delay_feedback = 0.6;
+        params.delay_time = 0.01;
+        params.delay_damping = 0.0;
+        params.delay_ping_pong = true;
+
+        let mut delay = StereoDelay::new(SR);
+        delay.snap(&params, 120.0);
+
+        let mut left = vec![0.0; 4096];
+        let mut right = vec![0.0; 4096];
+        left[0] = 1.0; // signal into the left channel only
+        run(&mut delay, &mut left, &mut right, &params);
+
+        // First repeat crosses to the right, second comes back to the left.
+        assert!(right[480].abs() > 0.5, "first repeat: {}", right[480]);
+        assert!(left[480].abs() < 1e-4, "leaked into left: {}", left[480]);
+        assert!(left[960].abs() > 0.3, "second repeat: {}", left[960]);
+    }
+
+    #[test]
+    fn sync_takes_its_time_from_the_tempo() {
+        let mut params = Params::default();
+        params.delay_mix = 1.0;
+        params.delay_feedback = 0.0;
+        params.delay_sync = true;
+        params.delay_division = NoteDivision::Eighth;
+        params.delay_time = 2.0; // ignored while sync is on
+        params.delay_damping = 0.0;
+
+        let mut delay = StereoDelay::new(SR);
+        delay.snap(&params, 120.0);
+
+        let mut left = vec![0.0; 32768];
+        let mut right = vec![0.0; 32768];
+        left[0] = 1.0;
+        run(&mut delay, &mut left, &mut right, &params);
+
+        // 1/8 at 120 BPM is 0.25 s: 12000 samples.
+        let loudest = left
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+            .map(|(i, _)| i)
+            .unwrap();
+        assert_eq!(loudest, 12000, "repeat landed at {loudest}");
+    }
+
+    #[test]
+    fn maximum_feedback_stays_bounded() {
+        let mut params = Params::default();
+        params.delay_mix = 1.0;
+        params.delay_feedback = 0.95;
+        params.delay_time = 0.005;
+        params.delay_damping = 0.0;
+
+        let mut delay = StereoDelay::new(SR);
+        delay.snap(&params, 120.0);
+
+        let mut left: Vec<f32> = (0..48000 * 4).map(|i| ((i % 71) as f32 / 35.0) - 1.0).collect();
+        let mut right = left.clone();
+        run(&mut delay, &mut left, &mut right, &params);
+
+        for (i, sample) in left.iter().enumerate() {
+            assert!(sample.is_finite(), "sample {i} was {sample}");
+            assert!(sample.abs() < 40.0, "sample {i} was {sample}");
+        }
     }
 }

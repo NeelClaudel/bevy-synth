@@ -3,5 +3,5 @@
 mod delay;
 mod line;
 
-pub use delay::NoteDivision;
+pub use delay::{NoteDivision, StereoDelay};
 pub use line::DelayLine;
