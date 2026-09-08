@@ -36,7 +36,10 @@ const DEFAULT_QUEUE_CAPACITY: usize = 1024;
 /// large. Rendering in bounded chunks keeps the scratch buffer a fixed
 /// allocation made before the stream starts, so the callback never allocates
 /// however big a buffer it is handed.
-const MAX_SCRATCH: usize = 8192;
+///
+/// Doubled from the mono era: the buffer now holds interleaved stereo frames,
+/// so the same number of frames needs twice the samples.
+const MAX_SCRATCH: usize = 16384;
 
 #[derive(Debug)]
 pub enum SynthError {
@@ -252,26 +255,43 @@ where
     let stream = device.build_output_stream(
         config,
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-            let frames = data.len() / channels.max(1);
+            let channels = channels.max(1);
+            let frames = data.len() / channels;
             let mut done = 0;
 
-            while done < frames {
-                let n = (frames - done).min(scratch.len());
-                let block = &mut scratch[..n];
-                engine.process(block);
-
-                for (frame_index, value) in block.iter().enumerate() {
-                    let sample = T::from_sample(*value);
-                    let base = (done + frame_index) * channels;
-                    // The engine is mono; the same signal goes to every
-                    // channel. Real stereo would mean per-voice panning, which
-                    // belongs in the engine, not here.
-                    for channel in 0..channels {
-                        data[base + channel] = sample;
+            if channels >= 2 {
+                while done < frames {
+                    let count = (frames - done).min(scratch.len() / 2);
+                    let block = &mut scratch[..count * 2];
+                    engine.process_stereo_interleaved(block);
+                    for frame_index in 0..count {
+                        let left = block[frame_index * 2];
+                        let right = block[frame_index * 2 + 1];
+                        let base = (done + frame_index) * channels;
+                        data[base] = T::from_sample(left);
+                        data[base + 1] = T::from_sample(right);
+                        if channels > 2 {
+                            // Surround devices get the centre sum in the rest
+                            // rather than silence, which would sound like a
+                            // broken driver.
+                            let centre = T::from_sample((left + right) * 0.5);
+                            for channel in 2..channels {
+                                data[base + channel] = centre;
+                            }
+                        }
                     }
+                    done += count;
                 }
-
-                done += n;
+            } else {
+                while done < frames {
+                    let count = (frames - done).min(scratch.len());
+                    let block = &mut scratch[..count];
+                    engine.process(block);
+                    for (frame_index, value) in block.iter().enumerate() {
+                        data[(done + frame_index) * channels] = T::from_sample(*value);
+                    }
+                    done += count;
+                }
             }
         },
         move |err| {
@@ -284,4 +304,43 @@ where
     )?;
 
     Ok(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_scratch_buffer_holds_a_full_stereo_block() {
+        // The scratch now carries interleaved frames, so it needs room for
+        // two samples per frame — and an odd length would split a frame.
+        assert!(MAX_SCRATCH >= 16384);
+        assert_eq!(MAX_SCRATCH % 2, 0);
+    }
+
+    #[test]
+    fn a_wet_engine_fills_both_channels_differently() {
+        use synth_core::{Engine, Event, Params, SharedParams};
+        use std::sync::Arc;
+
+        let params = Arc::new(SharedParams::from_params(&Params::default()));
+        let (tx, rx) = channel(64);
+        let mut engine = Engine::new(48000.0, params.clone(), rx);
+        params.seq_playing.set(false);
+        params.reverb_mix.set(0.8);
+        params.reverb_size.set(0.8);
+        tx.push(Event::NoteOn {
+            note: 60,
+            velocity: 0.8,
+        });
+
+        let mut scratch = vec![0.0f32; 8192];
+        engine.process_stereo_interleaved(&mut scratch);
+
+        let differing = scratch
+            .chunks_exact(2)
+            .filter(|frame| (frame[0] - frame[1]).abs() > 1e-6)
+            .count();
+        assert!(differing > 500, "only {differing} frames differed");
+    }
 }
