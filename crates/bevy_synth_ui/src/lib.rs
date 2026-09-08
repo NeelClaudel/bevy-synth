@@ -87,7 +87,21 @@ pub struct SynthUi {
     /// lock or a much larger telemetry block, to light up a few keys.
     sounding: Vec<u8>,
     meter_hold: f32,
+    /// Patterns put aside to switch between. Held here rather than in the
+    /// synth because they are a composing aid, not part of the sound: the
+    /// engine has one pattern, and these are the ones waiting their turn.
+    ///
+    /// They live as long as the app does. Saving them to disk would mean
+    /// deciding where a game's save data goes, which is the game's business
+    /// and not the panel's.
+    slots: [Option<synth_core::Pattern>; SLOTS],
+    /// The slot last loaded or saved, shown highlighted.
+    active_slot: Option<usize>,
 }
+
+/// Enough to hold a verse, a chorus and a couple of alternatives, which is as
+/// much as a row of buttons can show without becoming a file browser.
+const SLOTS: usize = 4;
 
 impl Default for SynthUi {
     fn default() -> Self {
@@ -99,6 +113,8 @@ impl Default for SynthUi {
             held_from_piano: None,
             sounding: Vec::new(),
             meter_hold: 0.0,
+            slots: [None; SLOTS],
+            active_slot: None,
         }
     }
 }
@@ -263,7 +279,7 @@ fn panel(
                 synth_columns(ui, &synth, visible_width);
 
                 ui.add_space(2.0);
-                sequencer(ui, &synth, &telemetry);
+                sequencer(ui, &synth, &telemetry, &mut ui_state);
                 ui.add_space(2.0);
                 keyboard(ui, &synth, &mut ui_state);
             });
@@ -881,7 +897,7 @@ fn voice_section(ui: &mut Ui, synth: &Synth) {
     });
 }
 
-fn sequencer(ui: &mut Ui, synth: &Synth, telemetry: &SynthTelemetry) {
+fn sequencer(ui: &mut Ui, synth: &Synth, telemetry: &SynthTelemetry, state: &mut SynthUi) {
     let p = &synth.params;
     widgets::section(ui, "SEQUENCER", palette::SEQ, |ui| {
         ui.horizontal_top(|ui| {
@@ -929,6 +945,10 @@ fn sequencer(ui: &mut Ui, synth: &Synth, telemetry: &SynthTelemetry) {
                 });
             });
         });
+
+        ui.add_space(4.0);
+        ui.separator();
+        pattern_slots(ui, synth, state);
 
         ui.add_space(4.0);
         ui.separator();
@@ -1009,6 +1029,71 @@ fn sequencer(ui: &mut Ui, synth: &Synth, telemetry: &SynthTelemetry) {
                 );
             });
         });
+    });
+}
+
+/// A row of saved patterns to switch between.
+///
+/// The generator is the point of this synth, but it is happy to throw away a
+/// good phrase on the next click. A few slots turn "that one was nice" into
+/// something you can come back to, and switching between two of them while the
+/// sequencer runs is arranging, not just auditioning.
+fn pattern_slots(ui: &mut Ui, synth: &Synth, state: &mut SynthUi) {
+    let pattern = synth.pattern();
+    let has_notes = pattern.iter().any(|step| step.active);
+
+    // The startup pattern is worth keeping without being asked: it is the one
+    // the player is listening to when the panel first opens, and losing it to
+    // an idle click on Generate is a poor introduction. Waits for a pattern
+    // with something in it, since the first frames can arrive before the
+    // engine has generated one.
+    if has_notes && state.slots.iter().all(Option::is_none) {
+        state.slots[0] = Some(pattern);
+        state.active_slot = Some(0);
+    }
+
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("PATTERNS")
+                .color(palette::TEXT_DIM)
+                .size(9.0),
+        );
+
+        for index in 0..SLOTS {
+            let filled = state.slots[index].is_some();
+            let active = state.active_slot == Some(index);
+            let label = egui::RichText::new(format!("{}", index + 1)).size(12.0);
+            let button = egui::Button::selectable(active, label);
+            let response = ui
+                .add_enabled(filled, button)
+                .on_hover_text("play this pattern, from the top of the next loop")
+                .on_disabled_hover_text("empty - press Save to put the current pattern here");
+            if response.clicked() {
+                if let Some(saved) = &state.slots[index] {
+                    synth.load_pattern(saved);
+                    state.active_slot = Some(index);
+                }
+            }
+        }
+
+        ui.add_space(6.0);
+        // Filling the next empty slot is what someone auditioning generated
+        // patterns wants: press Save whenever one is good, four times over,
+        // without first deciding where it goes. Once they are all full, the
+        // one being listened to is the one to replace.
+        let target = state
+            .slots
+            .iter()
+            .position(Option::is_none)
+            .or(state.active_slot)
+            .unwrap_or(0);
+        let save = ui
+            .add_enabled(has_notes, egui::Button::new("Save"))
+            .on_hover_text(format!("store the current pattern in slot {}", target + 1));
+        if save.clicked() {
+            state.slots[target] = Some(pattern);
+            state.active_slot = Some(target);
+        }
     });
 }
 

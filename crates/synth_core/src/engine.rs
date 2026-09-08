@@ -68,6 +68,7 @@ pub struct Engine {
 
     last_voice_mode: VoiceMode,
     last_regenerate: u32,
+    last_pattern_request: u32,
     peak: f32,
 }
 
@@ -112,6 +113,7 @@ impl Engine {
             block: vec![0.0; BLOCK],
             last_voice_mode: snapshot.voice_mode,
             last_regenerate: 0,
+            last_pattern_request: 0,
             peak: 0.0,
         };
         engine.sequencer.clock.set_tempo(snapshot.tempo, snapshot.steps_per_beat);
@@ -221,6 +223,14 @@ impl Engine {
         let count = left.len().min(right.len());
 
         let seq = self.sequencer.advance(count, params);
+        if self.sequencer.take_pattern_changed() {
+            // The pattern brought its own length, so the knob has to follow it
+            // or the next block's reconcile would cut the melody short.
+            self.params
+                .seq_length
+                .set(self.sequencer.pattern().len() as u32);
+            self.publish_pattern();
+        }
         if let Some(note) = seq.note_off {
             self.note_off(note, params);
         }
@@ -380,6 +390,20 @@ impl Engine {
         if requested != self.last_regenerate {
             self.last_regenerate = requested;
             self.regenerate(params);
+        }
+
+        // A saved pattern is loaded the same way, by counter. It is too big to
+        // travel through the event queue — every note-on would pay for the
+        // largest variant — so the control side stages it in the parameter
+        // block and bumps a counter once it is all there.
+        let requested = self
+            .params
+            .pending_request
+            .load(core::sync::atomic::Ordering::Relaxed);
+        if requested != self.last_pattern_request {
+            self.last_pattern_request = requested;
+            self.sequencer
+                .queue_pattern(self.params.read_pending_pattern());
         }
 
         // The transport can also be driven by the `seq_playing` parameter, for
@@ -640,6 +664,43 @@ mod tests {
 
     fn peak(buffer: &[f32]) -> f32 {
         buffer.iter().fold(0.0f32, |a, &b| a.max(b.abs()))
+    }
+
+    /// The whole load path, end to end: the control side stages a pattern, the
+    /// audio thread notices the counter, the sequencer adopts it, and the
+    /// mirror the UI reads is brought back into agreement with it. A break
+    /// anywhere along that chain leaves the grid showing one melody while the
+    /// speakers play another.
+    #[test]
+    fn a_loaded_pattern_reaches_the_sequencer_and_the_mirror() {
+        use crate::sequencer::{Pattern, Step, MAX_STEPS};
+        let (mut engine, _tx, params) = engine();
+
+        let mut steps = [Step::default(); MAX_STEPS];
+        for (i, step) in steps.iter_mut().enumerate().take(8) {
+            *step = Step {
+                active: true,
+                // Below anything the generator reaches, so this can only be
+                // the loaded pattern.
+                note: 12 + i as u8,
+                velocity: 1.0,
+                accent: false,
+            };
+        }
+        params.queue_pattern(&Pattern::new(steps, 8));
+
+        // Stopped, so the pattern lands on the first block rather than waiting
+        // for a bar line that will never come.
+        render(&mut engine, 64);
+
+        assert_eq!(engine.sequencer.pattern().len(), 8, "the length did not follow");
+        assert_eq!(params.seq_length.get(), 8, "the knob was left behind");
+        let mirror = params.read_pattern();
+        assert_eq!(mirror.len(), 8);
+        for (i, step) in mirror.iter().enumerate() {
+            assert!(step.active);
+            assert_eq!(step.note, 12 + i as u8, "step {i} in the mirror");
+        }
     }
 
     /// Below this, the output is inaudible: -80 dBFS, well under the noise

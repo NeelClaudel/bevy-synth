@@ -472,6 +472,29 @@ impl Default for Params {
     }
 }
 
+/// Packs a step into one word.
+///
+/// Bit 31 active, bit 30 accent, bits 8-15 note, bits 0-7 velocity quantised
+/// to 8 bits. Velocity to 1/255 is finer than any display or ear needs, and
+/// fitting a whole step into a single word is what makes it tear-free: the
+/// reader either sees the old step or the new one, never half of each.
+fn pack_step(step: &crate::sequencer::Step) -> u32 {
+    ((step.active as u32) << 31)
+        | ((step.accent as u32) << 30)
+        | ((step.note as u32) << 8)
+        | ((step.velocity.clamp(0.0, 1.0) * 255.0) as u32)
+}
+
+/// Unpacks a step written by [`pack_step`].
+fn unpack_step(packed: u32) -> crate::sequencer::Step {
+    crate::sequencer::Step {
+        active: packed & (1 << 31) != 0,
+        accent: packed & (1 << 30) != 0,
+        note: ((packed >> 8) & 0xFF) as u8,
+        velocity: (packed & 0xFF) as f32 / 255.0,
+    }
+}
+
 /// The shared, atomically-updatable parameter block.
 ///
 /// Wrap in an `Arc`, hand one clone to the audio thread and keep the other on
@@ -571,6 +594,22 @@ pub struct SharedParams {
     /// step keeps every step's read atomic, so a step is never seen half
     /// updated.
     pub pattern: [AtomicU32; crate::sequencer::MAX_STEPS],
+
+    /// A pattern staged by the control side, waiting for the audio thread to
+    /// adopt it. Packed the same way as the mirror above.
+    ///
+    /// Deliberately a second array rather than a reuse of that one: the audio
+    /// thread owns every write to the mirror, and having both sides write the
+    /// same words would be a genuine race. Each array stays one-directional.
+    /// The cost of the rule is 256 bytes.
+    pub pending_pattern: [AtomicU32; crate::sequencer::MAX_STEPS],
+    /// How many steps of `pending_pattern` are meaningful. A pattern carries
+    /// its own length, so loading one restores the loop length it was saved at.
+    pub pending_length: AtomicU32,
+    /// Bumped once the staging array is fully written, and never before. The
+    /// audio thread compares it against the last value it saw, so it can only
+    /// ever adopt a pattern that is completely there.
+    pub pending_request: AtomicU32,
 
     // --- Read-only telemetry, written by the audio thread ---
     /// Current sequencer step, for UI display.
@@ -673,6 +712,9 @@ impl SharedParams {
             gen_regenerate: AtomicU32::new(0),
 
             pattern: core::array::from_fn(|_| AtomicU32::new(0)),
+            pending_pattern: core::array::from_fn(|_| AtomicU32::new(0)),
+            pending_length: AtomicU32::new(0),
+            pending_request: AtomicU32::new(0),
 
             current_step: AtomicU32::new(0),
             active_voices: AtomicU32::new(0),
@@ -860,18 +902,9 @@ impl SharedParams {
 
     /// Publishes one step into the mirror. Called by the audio thread.
     pub fn publish_step(&self, index: usize, step: &crate::sequencer::Step) {
-        if index >= self.pattern.len() {
-            return;
+        if index < self.pattern.len() {
+            self.pattern[index].store(pack_step(step), REL);
         }
-        // Packing: bit 31 active, bit 30 accent, bits 8-15 note, bits 0-7
-        // velocity quantised to 8 bits. Velocity to 1/255 is finer than any
-        // display or ear needs, and packing into one word is what makes the
-        // read tear-free.
-        let packed = ((step.active as u32) << 31)
-            | ((step.accent as u32) << 30)
-            | ((step.note as u32) << 8)
-            | ((step.velocity.clamp(0.0, 1.0) * 255.0) as u32);
-        self.pattern[index].store(packed, REL);
     }
 
     /// Reads one step back out of the mirror.
@@ -879,19 +912,35 @@ impl SharedParams {
         if index >= self.pattern.len() {
             return crate::sequencer::Step::default();
         }
-        let packed = self.pattern[index].load(REL);
-        crate::sequencer::Step {
-            active: packed & (1 << 31) != 0,
-            accent: packed & (1 << 30) != 0,
-            note: ((packed >> 8) & 0xFF) as u8,
-            velocity: (packed & 0xFF) as f32 / 255.0,
-        }
+        unpack_step(self.pattern[index].load(REL))
     }
 
     /// Reads the whole pattern, as far as the current length.
     pub fn read_pattern(&self) -> crate::sequencer::Pattern {
         let len = (self.seq_length.get() as usize).clamp(1, crate::sequencer::MAX_STEPS);
         let steps = core::array::from_fn(|i| self.read_step(i));
+        crate::sequencer::Pattern::new(steps, len)
+    }
+
+    /// Stages a pattern for the sequencer to adopt, and asks for it. Called by
+    /// the control side, from anywhere, without waiting for anyone.
+    ///
+    /// The request counter goes last. Until it moves the audio thread has no
+    /// reason to look at the array, so a half-written pattern is never one it
+    /// could adopt.
+    pub fn queue_pattern(&self, pattern: &crate::sequencer::Pattern) {
+        for (slot, step) in self.pending_pattern.iter().zip(pattern.iter()) {
+            slot.store(pack_step(step), REL);
+        }
+        self.pending_length.store(pattern.len() as u32, REL);
+        self.pending_request.fetch_add(1, REL);
+    }
+
+    /// Reads the staged pattern back. Called by the audio thread once it sees
+    /// the request counter move.
+    pub fn read_pending_pattern(&self) -> crate::sequencer::Pattern {
+        let len = (self.pending_length.load(REL) as usize).clamp(1, crate::sequencer::MAX_STEPS);
+        let steps = core::array::from_fn(|i| unpack_step(self.pending_pattern[i].load(REL)));
         crate::sequencer::Pattern::new(steps, len)
     }
 
@@ -1007,6 +1056,50 @@ mod tests {
         // Out of range indices must be inert rather than panicking.
         shared.publish_step(9999, &crate::sequencer::Step::default());
         assert!(!shared.read_step(9999).active);
+    }
+
+    /// The staging array is how a pattern saved on the control side reaches the
+    /// audio thread. A step that came back wrong would play the wrong melody.
+    #[test]
+    fn a_staged_pattern_round_trips() {
+        use crate::sequencer::{Pattern, Step, MAX_STEPS};
+        let shared = SharedParams::default();
+
+        let mut steps = [Step::default(); MAX_STEPS];
+        steps[0] = Step {
+            active: true,
+            note: 60,
+            velocity: 1.0,
+            accent: true,
+        };
+        steps[3] = Step {
+            active: true,
+            note: 67,
+            velocity: 0.5,
+            accent: false,
+        };
+        shared.queue_pattern(&Pattern::new(steps, 8));
+
+        let back = shared.read_pending_pattern();
+        assert_eq!(back.len(), 8);
+        assert!(back[0].active && back[0].accent);
+        assert_eq!(back[0].note, 60);
+        assert_eq!(back[3].note, 67);
+        assert!((back[3].velocity - 0.5).abs() < 1.0 / 255.0 + 1e-6);
+        assert!(!back[1].active);
+    }
+
+    /// The counter is bumped last, after every step is in place, so the audio
+    /// thread cannot adopt a pattern it caught halfway through being written.
+    /// A counter rather than a flag, so two loads in one frame cannot collapse
+    /// into one.
+    #[test]
+    fn staging_a_pattern_bumps_the_request_counter() {
+        let shared = SharedParams::default();
+        let before = shared.pending_request.load(REL);
+        shared.queue_pattern(&crate::sequencer::Pattern::default());
+        shared.queue_pattern(&crate::sequencer::Pattern::default());
+        assert_eq!(shared.pending_request.load(REL) - before, 2);
     }
 
     #[test]

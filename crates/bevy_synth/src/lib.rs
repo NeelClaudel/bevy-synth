@@ -266,6 +266,17 @@ impl Synth {
         self.set_step(index, step)
     }
 
+    /// Plays a pattern saved earlier, from [`Synth::pattern`].
+    ///
+    /// The swap happens at the top of the next loop, so switching between
+    /// saved patterns while the sequencer runs never lands a new melody
+    /// halfway through a bar. Stopped, it takes effect immediately. The
+    /// pattern carries the loop length it was saved at, so loading one
+    /// restores that too.
+    pub fn load_pattern(&self, pattern: &synth_core::Pattern) {
+        self.params.queue_pattern(pattern);
+    }
+
     /// Writes a new generated pattern from the current `gen_*` parameters.
     ///
     /// Set `params.gen_seed` first for a specific melody, or leave it to get a

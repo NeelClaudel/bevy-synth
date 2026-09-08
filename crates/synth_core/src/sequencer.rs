@@ -164,6 +164,14 @@ pub struct Sequencer {
     /// Countdown to releasing it, from the gate length.
     samples_until_off: f32,
     pending: Option<Pending>,
+
+    /// A pattern the control side has loaded, waiting for the top of the loop.
+    queued: Option<Pattern>,
+    /// Set when a queued pattern lands, so the caller knows to republish it.
+    pattern_changed: bool,
+    /// The requested length from the previous block, so the reconcile in
+    /// `advance` can tell a knob turn from a length that merely differs.
+    last_length_param: usize,
 }
 
 impl Sequencer {
@@ -178,6 +186,9 @@ impl Sequencer {
             sounding: None,
             samples_until_off: 0.0,
             pending: None,
+            queued: None,
+            pattern_changed: false,
+            last_length_param: 16,
         }
     }
 
@@ -212,6 +223,37 @@ impl Sequencer {
     pub fn rewind(&mut self) {
         self.position = usize::MAX;
         self.pending = None;
+    }
+
+    /// Loads a pattern, to take effect at the top of the next loop.
+    ///
+    /// Swapping mid-phrase moves the melody under the ear halfway through a
+    /// bar. Waiting for the wrap puts the change where a listener is expecting
+    /// one anyway. With the transport stopped no wrap is coming, so `advance`
+    /// applies it at once instead.
+    pub fn queue_pattern(&mut self, pattern: Pattern) {
+        self.queued = Some(pattern);
+    }
+
+    /// Reports, once, that a loaded pattern has landed. The caller republishes
+    /// the pattern on the strength of it, so a second `true` would be a wasted
+    /// copy and a missed one would leave a stale display.
+    pub fn take_pattern_changed(&mut self) -> bool {
+        core::mem::replace(&mut self.pattern_changed, false)
+    }
+
+    /// Adopts a loaded pattern, length and all. A pattern is saved with the
+    /// loop length it was written at, and the two belong together: half a
+    /// melody looping is not the melody.
+    fn apply_pattern(&mut self, pattern: &Pattern) {
+        self.pattern[..pattern.len()].copy_from_slice(pattern);
+        // An empty pattern would leave nothing to play, and a modulo by zero
+        // to do it with.
+        self.length = pattern.len().max(1);
+        if self.position != usize::MAX && self.position >= self.length {
+            self.position = 0;
+        }
+        self.pattern_changed = true;
     }
 
     /// Writes a fresh pattern.
@@ -303,10 +345,24 @@ impl Sequencer {
             self.clock.set_tempo(p.tempo, p.steps_per_beat);
         }
 
-        if self.length != p.seq_length.clamp(1, MAX_STEPS) {
-            self.length = p.seq_length.clamp(1, MAX_STEPS);
+        // Only when the knob actually moves. Comparing against our own length
+        // instead would fight a loaded pattern, whose length comes from the
+        // pattern rather than from this block's snapshot of the parameters.
+        let requested_length = p.seq_length.clamp(1, MAX_STEPS);
+        if requested_length != self.last_length_param {
+            self.last_length_param = requested_length;
+            self.length = requested_length;
             if self.position != usize::MAX && self.position >= self.length {
                 self.position = 0;
+            }
+        }
+
+        // Stopped, there is no bar line to wait for. Checked here rather than
+        // in `queue_pattern` so that both orderings land: loaded while stopped,
+        // and loaded while playing and then stopped before the wrap came.
+        if !self.clock.is_running() {
+            if let Some(pattern) = self.queued.take() {
+                self.apply_pattern(&pattern);
             }
         }
 
@@ -352,11 +408,20 @@ impl Sequencer {
 
     /// Moves to the next step and triggers whatever is there.
     fn step(&mut self, p: &Params, out: &mut SeqOutput) {
-        self.position = if self.position == usize::MAX {
+        let next = if self.position == usize::MAX {
             0
         } else {
             (self.position + 1) % self.length
         };
+        // Swap at the top of the loop, before the step is read, so the new
+        // pattern is heard from its own first note rather than from wherever
+        // the old one happened to be.
+        if next == 0 {
+            if let Some(pattern) = self.queued.take() {
+                self.apply_pattern(&pattern);
+            }
+        }
+        self.position = next;
         out.stepped = true;
 
         let step = self.pattern[self.position];
@@ -643,5 +708,97 @@ mod tests {
             mean(&long),
             mean(&short)
         );
+    }
+
+    /// A pattern of nothing but `note`, for telling a loaded pattern apart from
+    /// a generated one. The generator here works in octave 3 and up, so a note
+    /// this low can only have come from the load.
+    fn marker_pattern(note: u8, len: usize) -> Pattern {
+        let steps = [Step {
+            active: true,
+            note,
+            velocity: 1.0,
+            accent: false,
+        }; MAX_STEPS];
+        Pattern::new(steps, len)
+    }
+
+    /// Runs the sequencer until `stop` says so, giving up rather than hanging
+    /// if the condition never comes true.
+    fn run_until(s: &mut Sequencer, p: &Params, what: &str, stop: impl Fn(&Sequencer) -> bool) {
+        for _ in 0..100_000 {
+            if stop(s) {
+                return;
+            }
+            s.advance(BLOCK, p);
+        }
+        panic!("gave up waiting for {what}");
+    }
+
+    /// Swapping patterns mid-phrase moves the melody under the ear halfway
+    /// through a bar. The swap waits for the top of the loop, where a listener
+    /// is expecting a change anyway.
+    #[test]
+    fn a_queued_pattern_waits_for_the_bar_line() {
+        let mut s = Sequencer::new(48000.0, 8);
+        s.regenerate(&settings());
+        let before = s.pattern().to_vec();
+
+        let mut p = Params::default();
+        p.tempo = 120.0;
+        p.steps_per_beat = 4.0;
+        s.clock.start();
+
+        // Get off step zero first, so the wrap we are waiting for is a real one.
+        run_until(&mut s, &p, "the first step", |s| s.position() == 1);
+
+        s.queue_pattern(marker_pattern(12, 16));
+        s.advance(BLOCK, &p);
+        assert_eq!(s.pattern(), before.as_slice(), "swapped mid-loop");
+        assert!(!s.take_pattern_changed());
+
+        run_until(&mut s, &p, "the bar line", |s| s.position() == 0);
+        assert!(
+            s.pattern().iter().all(|step| step.note == 12),
+            "did not swap at the bar line"
+        );
+        assert!(s.take_pattern_changed(), "the swap went unannounced");
+        assert!(!s.take_pattern_changed(), "the flag did not clear");
+    }
+
+    /// With the transport stopped there is no bar line coming, so a queued
+    /// pattern lands at once — including one queued a moment before the stop.
+    #[test]
+    fn a_queued_pattern_lands_at_once_when_stopped() {
+        let mut s = Sequencer::new(48000.0, 8);
+        s.regenerate(&settings());
+        let p = Params::default();
+
+        s.queue_pattern(marker_pattern(12, 8));
+        s.advance(BLOCK, &p);
+
+        assert_eq!(s.pattern().len(), 8, "the pattern brought its own length");
+        assert!(s.pattern().iter().all(|step| step.note == 12));
+        assert!(s.take_pattern_changed());
+    }
+
+    /// Clicking through slots faster than the bar goes round. Only the last one
+    /// should ever be heard.
+    #[test]
+    fn the_last_queued_pattern_wins() {
+        let mut s = Sequencer::new(48000.0, 8);
+        s.regenerate(&settings());
+
+        let mut p = Params::default();
+        p.tempo = 120.0;
+        p.steps_per_beat = 4.0;
+        s.clock.start();
+        run_until(&mut s, &p, "the first step", |s| s.position() == 1);
+
+        s.queue_pattern(marker_pattern(12, 16));
+        s.queue_pattern(marker_pattern(24, 16));
+
+        run_until(&mut s, &p, "the bar line", |s| s.position() == 0);
+        assert!(s.pattern().iter().all(|step| step.note == 24));
     }
 }
