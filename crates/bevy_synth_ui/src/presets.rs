@@ -9,10 +9,10 @@
 //! # What a preset does and does not touch
 //!
 //! Presets set the *patch*: oscillators, filter, envelopes, LFO, voice mode,
-//! output, and effects. They deliberately leave the sequencer and generator alone — tempo,
-//! key, scale and pattern length belong to the piece you are writing, not to
-//! the sound, and having them reset every time you auditioned a patch would be
-//! infuriating.
+//! output, and effects. They deliberately leave the sequencer and generator
+//! alone — tempo, key, scale and pattern length belong to the piece you are
+//! writing, not to the sound, and having them reset every time you auditioned
+//! a patch would be infuriating.
 
 use bevy_egui::egui;
 use egui::Ui;
@@ -383,6 +383,7 @@ fn wind(p: &SharedParams) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use synth_core::params::Params;
 
     /// Every preset must leave the synth in a state that actually makes a
     /// sound. A patch with every level at zero is a silent bug that is easy to
@@ -458,8 +459,6 @@ mod tests {
 
     #[test]
     fn effects_do_not_leak_between_presets() {
-        use synth_core::params::Params;
-
         let params = SharedParams::from_params(&Params::default());
 
         // A thoroughly wet patch.
@@ -499,8 +498,6 @@ mod tests {
 
     #[test]
     fn some_presets_use_the_effects() {
-        use synth_core::params::Params;
-
         let params = SharedParams::from_params(&Params::default());
         let wet = ALL
             .iter()
