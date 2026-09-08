@@ -44,10 +44,14 @@ App::new()
 Hear it before wiring anything up:
 
 ```
-cargo run -p bevy_synth_ui --example synth_editor --release  # the full panel, in a window
-cargo run -p bevy_synth --example generative_jam             # jams with itself, headless
-cargo run -p synth_audio --bin render-demo -- ./out          # five patches to WAV, no sound card
+cargo run                                          # the full panel, in a window
+cargo run -p bevy_synth --example generative_jam   # jams with itself, headless
+cargo run -p synth_audio --bin render-demo -- ./out # five patches to WAV, no sound card
 ```
+
+`cargo run` builds the workspace root, which is the app in `src/main.rs`. Add
+`--release` if the audio crackles. The library crates are tested with
+`cargo test --workspace`.
 
 ## The panel
 
@@ -195,5 +199,6 @@ The obvious next moves, roughly in order of value per line of code:
 ## Licence
 
 MIT OR Apache-2.0.
-#   b e v y - s y n t h  
+#   b e v y - s y n t h 
+ 
  
