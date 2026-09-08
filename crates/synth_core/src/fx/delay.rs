@@ -211,10 +211,12 @@ impl StereoDelay {
         };
 
         for i in 0..count {
-            let time = time_from + step * i as f32;
+            let time = time_from + step * i as f32 - 1.0;
             let dry_left = left[i];
             let dry_right = right[i];
 
+            // The line is read before this sample is written, so reading one short of the
+            // delay time puts the repeat exactly `time_from / time_to` samples after the input.
             let wet_left = self.left.read_frac(time);
             let wet_right = self.right.read_frac(time);
 
