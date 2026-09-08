@@ -314,7 +314,9 @@ mod tests {
     fn the_scratch_buffer_holds_a_full_stereo_block() {
         // The scratch now carries interleaved frames, so it needs room for
         // two samples per frame — and an odd length would split a frame.
-        assert!(MAX_SCRATCH >= 16384);
+        // A const block, so a bad value fails the build rather than waiting
+        // for someone to run the tests.
+        const { assert!(MAX_SCRATCH >= 16384) };
         assert_eq!(MAX_SCRATCH % 2, 0);
     }
 
