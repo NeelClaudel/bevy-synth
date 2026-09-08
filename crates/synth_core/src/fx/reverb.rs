@@ -190,7 +190,7 @@ fn decay_for(size: f32) -> f32 {
 }
 
 impl PlateReverb {
-    /// Not real-time safe: allocates twelve delay lines.
+    /// Not real-time safe: allocates thirteen delay lines.
     pub fn new(sample_rate: f32) -> Self {
         let sample_rate = if sample_rate > 0.0 { sample_rate } else { 48000.0 };
         let ratio = sample_rate / REFERENCE_RATE;
@@ -584,6 +584,63 @@ mod tests {
             // bounded, peaking around 7x. 16.0 separates "correct but loud"
             // from "diverging" while leaving headroom over that.
             assert!(sample.abs() <= 16.0, "sample {i} was {sample}");
+        }
+    }
+
+    #[test]
+    fn bypass_clears_tail_on_reenable() {
+        // Big size, low damping: a long, persistent tail, so a frozen tank
+        // would still clearly be audible by the time we come back to check
+        // it.
+        let mut params = wet(1.0, 0.9, 0.1);
+        let mut reverb = PlateReverb::new(SR);
+        reverb.snap(&params);
+
+        let mut left = vec![0.0; SR as usize];
+        let mut right = vec![0.0; SR as usize];
+        left[0] = 1.0;
+        right[0] = 1.0;
+
+        // Build up a tail.
+        let build = (SR * 0.2) as usize;
+        run(&mut reverb, &mut left[..build], &mut right[..build], &params);
+        let tail_rms = rms(&left[build - 2000..build]);
+        assert!(tail_rms > 1e-4, "no tail built up before bypass: {tail_rms}");
+
+        // Turn the reverb off and run long enough for the mix smoother to
+        // settle and engage the early-out bypass. One lap of the tank's
+        // feedback loop is on the order of 25,000 samples at 48 kHz, so half
+        // a second of silence is nowhere near enough for the untreated tank
+        // to ring itself down on its own; if the residual disappears here it
+        // is because it was cleared, not because it decayed away.
+        params.reverb_mix = 0.0;
+        let settle_end = build + (SR * 0.5) as usize;
+        run(
+            &mut reverb,
+            &mut left[build..settle_end],
+            &mut right[build..settle_end],
+            &params,
+        );
+
+        // Re-enable with silent input. With the tank cleared there is
+        // nothing left to feed the taps, so the output can only be silence.
+        // If `clear_tank` were skipped, the bypass early-out would have
+        // frozen the tank mid-ring rather than let it decay, and that frozen
+        // tail would leak straight back out here.
+        params.reverb_mix = 1.0;
+        run(
+            &mut reverb,
+            &mut left[settle_end..],
+            &mut right[settle_end..],
+            &params,
+        );
+
+        for (i, sample) in left[settle_end..]
+            .iter()
+            .chain(right[settle_end..].iter())
+            .enumerate()
+        {
+            assert_eq!(*sample, 0.0, "resurgent tail after reenable at {i}: {sample}");
         }
     }
 }
