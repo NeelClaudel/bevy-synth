@@ -1,0 +1,29 @@
+[package]
+name = "bevy_synth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A subtractive synthesizer plugin for Bevy: polyphonic voices, filters, envelopes, MIDI and a generative sequencer."
+
+[dependencies]
+synth_core = { path = "../synth_core" }
+synth_audio = { path = "../synth_audio", default-features = false }
+
+# The ECS sub-crates rather than the `bevy` umbrella. This plugin needs an App,
+# a Resource and one system; pulling in the renderer, asset server and windowing
+# to get them would add minutes to every build for nothing. Any Bevy app can
+# still use this, so long as the version here matches the Bevy version in use.
+bevy_app = "0.19"
+bevy_ecs = "0.19"
+bevy_log = "0.19"
+bevy_input = { version = "0.19", optional = true, features = ["keyboard"] }
+
+[features]
+default = ["midi", "keyboard"]
+# Hardware MIDI keyboard, controllers and clock.
+midi = ["synth_audio/midi"]
+# Play the synth from the computer keyboard, tracker-style.
+keyboard = ["dep:bevy_input"]
+
+[dev-dependencies]
+bevy_log = "0.19"

@@ -1,0 +1,8 @@
+[package]
+name = "synth_core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Real-time synthesis core: oscillators, filters, envelopes, voice pool, sequencer. No engine dependencies."
+
+[dependencies]

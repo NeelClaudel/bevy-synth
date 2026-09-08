@@ -1,0 +1,20 @@
+[package]
+name = "bevy_synth_ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "An egui control panel for bevy_synth: knobs, envelope and filter displays, sequencer grid and an on-screen keyboard."
+
+[dependencies]
+bevy_synth = { path = "../bevy_synth" }
+synth_core = { path = "../synth_core" }
+
+bevy_app = "0.19"
+bevy_ecs = "0.19"
+bevy_egui = "0.42"
+egui = "0.36"
+
+[dev-dependencies]
+# The example needs a real window, so it pulls the full engine. The library
+# above does not: a game that already has a window pays none of this.
+bevy = "0.19"

@@ -1,0 +1,21 @@
+[package]
+name = "synth_audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Audio output and MIDI input for synth_core: cpal stream host, midir keyboard and clock."
+
+[dependencies]
+cpal = "0.18.2"
+midir = { version = "0.11.0", optional = true }
+synth_core = { path = "../synth_core" }
+
+[features]
+default = ["midi"]
+# MIDI input is optional: it pulls in a platform MIDI stack that a game shipping
+# with only a sequencer and an on-screen keyboard has no use for.
+midi = ["dep:midir"]
+
+[[bin]]
+name = "render-demo"
+path = "src/bin/render_demo.rs"

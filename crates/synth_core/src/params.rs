@@ -1,0 +1,888 @@
+//! The bridge between the control thread and the audio thread.
+//!
+//! # The problem
+//!
+//! Bevy's schedule runs at ~60 Hz with whatever jitter a frame spike brings.
+//! The audio callback runs every few milliseconds and must *never* be late: if
+//! it is, the driver plays whatever was left in the buffer and the user hears a
+//! click. So the audio thread can never take a lock the game thread might hold,
+//! and can never allocate.
+//!
+//! # The solution
+//!
+//! Every parameter is an atomic. The control side stores; the audio side loads
+//! once per block into a plain [`Params`] struct and works from that. No locks,
+//! no allocation, no blocking, and a torn read is impossible because each
+//! parameter is a single word.
+//!
+//! Reads use `Relaxed` ordering throughout. There is nothing to synchronise —
+//! we do not care whether the cutoff change lands one block before or after the
+//! resonance change, only that neither is torn. Paying for `Acquire`/`Release`
+//! on every knob, every block, would be waste.
+//!
+//! # Why smoothing is not optional
+//!
+//! Jumping a gain or cutoff between blocks is a step discontinuity, and a step
+//! is broadband click. Drag a knob and you get one per block: the "zipper
+//! noise" that makes hand-rolled synths sound broken. [`Smoothed`] one-poles
+//! every continuous parameter toward its target so a knob sweep is a sweep.
+
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+use crate::env::AdsrSettings;
+use crate::filter::{Slope, SvfMode};
+use crate::lfo::{LfoTarget, LfoWave};
+use crate::osc::Waveform;
+use crate::scale::Scale;
+
+const REL: Ordering = Ordering::Relaxed;
+
+/// An `f32` stored atomically, via its bit pattern.
+///
+/// Rust has no `AtomicF32`. Transmuting through `u32` is the standard workaround
+/// and is exactly what every audio library does; `to_bits`/`from_bits` are
+/// lossless and total, so no value is lost, including NaN.
+#[derive(Debug)]
+pub struct AtomicF32(AtomicU32);
+
+impl AtomicF32 {
+    pub const fn new(v: f32) -> Self {
+        Self(AtomicU32::new(v.to_bits()))
+    }
+    #[inline]
+    pub fn get(&self) -> f32 {
+        f32::from_bits(self.0.load(REL))
+    }
+    #[inline]
+    pub fn set(&self, v: f32) {
+        self.0.store(v.to_bits(), REL);
+    }
+}
+
+/// A `bool` stored atomically as a `u32`, for uniformity with the rest.
+#[derive(Debug)]
+pub struct AtomicBool32(AtomicU32);
+
+impl AtomicBool32 {
+    pub const fn new(v: bool) -> Self {
+        Self(AtomicU32::new(v as u32))
+    }
+    #[inline]
+    pub fn get(&self) -> bool {
+        self.0.load(REL) != 0
+    }
+    #[inline]
+    pub fn set(&self, v: bool) {
+        self.0.store(v as u32, REL);
+    }
+}
+
+/// A `u32` enum discriminant stored atomically.
+#[derive(Debug)]
+pub struct AtomicEnum(AtomicU32);
+
+impl AtomicEnum {
+    pub const fn new(v: u32) -> Self {
+        Self(AtomicU32::new(v))
+    }
+    #[inline]
+    pub fn get(&self) -> u32 {
+        self.0.load(REL)
+    }
+    #[inline]
+    pub fn set(&self, v: u32) {
+        self.0.store(v, REL);
+    }
+}
+
+/// How voices are allocated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u32)]
+pub enum VoiceMode {
+    /// One voice. Later notes take over the single voice; releasing one while
+    /// another is held falls back to it, which is what makes basslines work.
+    Mono = 0,
+    /// Many voices, one per held note, with stealing when they run out.
+    #[default]
+    Poly = 1,
+}
+
+impl VoiceMode {
+    pub fn from_u32(v: u32) -> Self {
+        if v == 0 {
+            VoiceMode::Mono
+        } else {
+            VoiceMode::Poly
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            VoiceMode::Mono => "Mono",
+            VoiceMode::Poly => "Poly",
+        }
+    }
+}
+
+/// Where the sequencer gets its tempo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u32)]
+pub enum ClockSource {
+    /// Count samples against a BPM set here. Standalone.
+    #[default]
+    Internal = 0,
+    /// Advance on incoming MIDI clock ticks, 24 per quarter note. Locks to a
+    /// DAW or a drum machine.
+    ExternalMidi = 1,
+}
+
+impl ClockSource {
+    pub fn from_u32(v: u32) -> Self {
+        if v == 1 {
+            ClockSource::ExternalMidi
+        } else {
+            ClockSource::Internal
+        }
+    }
+}
+
+/// A one-pole smoother for a continuous parameter.
+///
+/// Runs at control rate (once per [`crate::BLOCK`]), not per sample: at 48 kHz
+/// with a 32-sample block that is 1.5 kHz, far above any knob movement, and 32x
+/// cheaper than smoothing every sample.
+#[derive(Debug, Clone)]
+pub struct Smoothed {
+    value: f32,
+    target: f32,
+    coef: f32,
+}
+
+impl Smoothed {
+    /// `time_ms` is the time constant: how long to cover ~63% of the distance.
+    /// 5-20 ms suits knobs. Too fast and it clicks; too slow and the synth
+    /// feels rubbery under the fingers.
+    pub fn new(initial: f32, time_ms: f32, control_rate: f32) -> Self {
+        let mut s = Self {
+            value: initial,
+            target: initial,
+            coef: 0.0,
+        };
+        s.set_time(time_ms, control_rate);
+        s
+    }
+
+    pub fn set_time(&mut self, time_ms: f32, control_rate: f32) {
+        let samples = (time_ms / 1000.0) * control_rate;
+        self.coef = if samples <= 1.0 {
+            0.0
+        } else {
+            (-1.0 / samples).exp()
+        };
+    }
+
+    #[inline]
+    pub fn set_target(&mut self, target: f32) {
+        self.target = target;
+    }
+
+    /// Jumps straight to a value with no ramp. For patch loads and voice
+    /// starts, where there is no previous value worth gliding from.
+    #[inline]
+    pub fn snap(&mut self, value: f32) {
+        self.value = value;
+        self.target = value;
+    }
+
+    #[inline]
+    pub fn value(&self) -> f32 {
+        self.value
+    }
+
+    /// Advances one control-rate step.
+    // Not `Iterator::next`, for the same reason as `Adsr::next`: this is an
+    // endless signal, not a sequence that can run out.
+    #[allow(clippy::should_implement_trait)]
+    #[inline]
+    pub fn next(&mut self) -> f32 {
+        self.value = self.target + (self.value - self.target) * self.coef;
+        // Settle exactly, so a parameter that should be zero really is.
+        if (self.value - self.target).abs() < 1e-7 {
+            self.value = self.target;
+        }
+        self.value
+    }
+}
+
+/// Every parameter, as the audio thread sees it after one block-boundary read.
+///
+/// Plain fields, `Copy`, no atomics: once the audio thread has this it can
+/// touch it as often as it likes with no synchronisation cost.
+#[derive(Debug, Clone, Copy)]
+pub struct Params {
+    // --- Oscillator 1 ---
+    pub osc1_wave: Waveform,
+    pub osc1_level: f32,
+    /// Coarse tuning, in semitones.
+    pub osc1_semitones: f32,
+    /// Fine tuning, in cents. Detuning two oscillators a few cents apart is
+    /// what gives a synth its width — they beat against each other slowly.
+    pub osc1_detune: f32,
+
+    // --- Oscillator 2 ---
+    pub osc2_wave: Waveform,
+    pub osc2_level: f32,
+    pub osc2_semitones: f32,
+    pub osc2_detune: f32,
+
+    /// Duty cycle for [`Waveform::Pulse`], shared by both oscillators.
+    pub pulse_width: f32,
+    /// A square one octave below osc 1. Cheap weight for basses.
+    pub sub_level: f32,
+    pub noise_level: f32,
+
+    // --- Filter ---
+    pub filter_mode: SvfMode,
+    pub filter_slope: Slope,
+    pub cutoff: f32,
+    pub resonance: f32,
+    /// How far the filter envelope moves the cutoff, in octaves. Negative
+    /// values close the filter as the envelope opens, which is unusual and
+    /// occasionally exactly right.
+    pub filter_env_amount: f32,
+    /// How much the played note raises the cutoff. At 1.0 the filter tracks the
+    /// keyboard exactly, so every note has the same timbre; at 0.0 high notes
+    /// are duller than low ones. Around 0.3-0.5 usually sounds most natural.
+    pub filter_key_track: f32,
+    /// How much velocity opens the filter. Playing harder sounding brighter is
+    /// most of what makes a synth feel responsive.
+    pub filter_velocity: f32,
+
+    // --- Envelopes ---
+    pub amp_env: AdsrSettings,
+    pub filter_env: AdsrSettings,
+
+    // --- LFO ---
+    pub lfo_wave: LfoWave,
+    pub lfo_rate: f32,
+    pub lfo_depth: f32,
+    pub lfo_target: LfoTarget,
+    /// Restart the LFO on every note instead of letting it free-run.
+    pub lfo_retrigger: bool,
+
+    // --- Voices ---
+    pub voice_mode: VoiceMode,
+    pub max_voices: usize,
+    /// Portamento time in seconds: how long a new note takes to slide from the
+    /// previous pitch. Zero disables it.
+    pub glide: f32,
+    /// In mono mode, whether overlapping notes retrigger the envelopes.
+    pub legato: bool,
+    /// Pitch bend in semitones, from the wheel.
+    pub pitch_bend: f32,
+    /// Mod wheel, 0-1. Scales LFO depth, so a patch can be still until asked.
+    pub mod_wheel: f32,
+
+    // --- Output ---
+    pub master_gain: f32,
+    /// Pre-limiter drive. Above 1.0 pushes the output into the soft clipper for
+    /// saturation rather than clean gain.
+    pub drive: f32,
+
+    // --- Sequencer ---
+    pub seq_playing: bool,
+    pub clock_source: ClockSource,
+    pub tempo: f32,
+    /// Sequencer steps per quarter note. 4 = sixteenth notes.
+    pub steps_per_beat: f32,
+    /// Pattern length in steps.
+    pub seq_length: usize,
+    /// Note length as a fraction of one step. Below ~0.9 gives separation
+    /// between notes; above 1.0 overlaps them into a legato line.
+    pub seq_gate: f32,
+    /// Delays every other step, as a fraction of a step. 0.0 is straight,
+    /// 0.33 is a hard shuffle.
+    pub seq_swing: f32,
+
+    // --- Generative ---
+    pub gen_enabled: bool,
+    /// Root note as a pitch class, 0 = C.
+    pub gen_root: u8,
+    pub gen_scale: Scale,
+    /// Lowest octave the generator will write in.
+    pub gen_octave: i32,
+    /// How many octaves above that it may reach.
+    pub gen_range: u32,
+    /// Probability that a step has a note rather than a rest.
+    pub gen_density: f32,
+    /// How far the melody may leap, in scale degrees. Low values make it walk.
+    pub gen_max_jump: f32,
+    /// How strongly downbeats are pulled toward chord tones (root, third,
+    /// fifth). This is most of what separates "random notes in a scale" from
+    /// something that sounds composed.
+    pub gen_chord_bias: f32,
+}
+
+impl Default for Params {
+    fn default() -> Self {
+        Self {
+            osc1_wave: Waveform::Saw,
+            osc1_level: 0.8,
+            osc1_semitones: 0.0,
+            osc1_detune: 0.0,
+
+            osc2_wave: Waveform::Saw,
+            osc2_level: 0.5,
+            osc2_semitones: 0.0,
+            // Seven cents sharp: slow enough to sound like two oscillators
+            // rather than one out of tune.
+            osc2_detune: 7.0,
+
+            pulse_width: 0.5,
+            sub_level: 0.0,
+            noise_level: 0.0,
+
+            filter_mode: SvfMode::Lowpass,
+            filter_slope: Slope::Db24,
+            cutoff: 2000.0,
+            resonance: 0.25,
+            filter_env_amount: 2.0,
+            filter_key_track: 0.35,
+            filter_velocity: 0.4,
+
+            amp_env: AdsrSettings {
+                attack: 0.005,
+                decay: 0.25,
+                sustain: 0.7,
+                release: 0.25,
+            },
+            filter_env: AdsrSettings {
+                attack: 0.002,
+                decay: 0.35,
+                sustain: 0.25,
+                release: 0.3,
+            },
+
+            lfo_wave: LfoWave::Sine,
+            lfo_rate: 5.0,
+            lfo_depth: 0.0,
+            lfo_target: LfoTarget::Cutoff,
+            lfo_retrigger: false,
+
+            voice_mode: VoiceMode::Poly,
+            max_voices: 16,
+            glide: 0.0,
+            legato: true,
+            pitch_bend: 0.0,
+            mod_wheel: 0.0,
+
+            master_gain: 0.5,
+            drive: 1.0,
+
+            seq_playing: false,
+            clock_source: ClockSource::Internal,
+            tempo: 120.0,
+            steps_per_beat: 4.0,
+            seq_length: 16,
+            seq_gate: 0.6,
+            seq_swing: 0.0,
+
+            gen_enabled: true,
+            gen_root: 0,
+            gen_scale: Scale::MinorPentatonic,
+            gen_octave: 3,
+            gen_range: 2,
+            gen_density: 0.75,
+            gen_max_jump: 3.0,
+            gen_chord_bias: 0.6,
+        }
+    }
+}
+
+/// The shared, atomically-updatable parameter block.
+///
+/// Wrap in an `Arc`, hand one clone to the audio thread and keep the other on
+/// the control side. Every setter is `&self`, so no locking and no `&mut`
+/// plumbing through the ECS.
+#[derive(Debug)]
+pub struct SharedParams {
+    pub osc1_wave: AtomicEnum,
+    pub osc1_level: AtomicF32,
+    pub osc1_semitones: AtomicF32,
+    pub osc1_detune: AtomicF32,
+
+    pub osc2_wave: AtomicEnum,
+    pub osc2_level: AtomicF32,
+    pub osc2_semitones: AtomicF32,
+    pub osc2_detune: AtomicF32,
+
+    pub pulse_width: AtomicF32,
+    pub sub_level: AtomicF32,
+    pub noise_level: AtomicF32,
+
+    pub filter_mode: AtomicEnum,
+    pub filter_slope: AtomicEnum,
+    pub cutoff: AtomicF32,
+    pub resonance: AtomicF32,
+    pub filter_env_amount: AtomicF32,
+    pub filter_key_track: AtomicF32,
+    pub filter_velocity: AtomicF32,
+
+    pub amp_attack: AtomicF32,
+    pub amp_decay: AtomicF32,
+    pub amp_sustain: AtomicF32,
+    pub amp_release: AtomicF32,
+
+    pub filter_attack: AtomicF32,
+    pub filter_decay: AtomicF32,
+    pub filter_sustain: AtomicF32,
+    pub filter_release: AtomicF32,
+
+    pub lfo_wave: AtomicEnum,
+    pub lfo_rate: AtomicF32,
+    pub lfo_depth: AtomicF32,
+    pub lfo_target: AtomicEnum,
+    pub lfo_retrigger: AtomicBool32,
+
+    pub voice_mode: AtomicEnum,
+    pub max_voices: AtomicEnum,
+    pub glide: AtomicF32,
+    pub legato: AtomicBool32,
+    pub pitch_bend: AtomicF32,
+    pub mod_wheel: AtomicF32,
+
+    pub master_gain: AtomicF32,
+    pub drive: AtomicF32,
+
+    pub seq_playing: AtomicBool32,
+    pub clock_source: AtomicEnum,
+    pub tempo: AtomicF32,
+    pub steps_per_beat: AtomicF32,
+    pub seq_length: AtomicEnum,
+    pub seq_gate: AtomicF32,
+    pub seq_swing: AtomicF32,
+
+    pub gen_enabled: AtomicBool32,
+    pub gen_root: AtomicEnum,
+    pub gen_scale: AtomicEnum,
+    pub gen_octave: AtomicEnum,
+    pub gen_range: AtomicEnum,
+    pub gen_density: AtomicF32,
+    pub gen_max_jump: AtomicF32,
+    pub gen_chord_bias: AtomicF32,
+    pub gen_seed: AtomicU64,
+    /// Bumped by the control side to ask for a fresh pattern. The audio thread
+    /// compares it against the last value it saw; a counter rather than a flag
+    /// so two requests in one frame cannot collapse into one.
+    pub gen_regenerate: AtomicU32,
+
+    /// The current pattern, mirrored for the control side to display.
+    ///
+    /// The real pattern lives inside the sequencer on the audio thread. Rather
+    /// than lock it, the engine publishes a packed copy here whenever it
+    /// changes; a UI reads it with no synchronisation at all. One `u32` per
+    /// step keeps every step's read atomic, so a step is never seen half
+    /// updated.
+    pub pattern: [AtomicU32; crate::sequencer::MAX_STEPS],
+
+    // --- Read-only telemetry, written by the audio thread ---
+    /// Current sequencer step, for UI display.
+    pub current_step: AtomicU32,
+    /// How many voices are sounding, for UI display.
+    pub active_voices: AtomicU32,
+    /// Peak output level since last read, for a meter.
+    pub output_peak: AtomicF32,
+}
+
+impl Default for SharedParams {
+    fn default() -> Self {
+        Self::from_params(Params::default())
+    }
+}
+
+impl SharedParams {
+    /// Builds a shared block from a plain snapshot. This is how patches load.
+    pub fn from_params(p: Params) -> Self {
+        Self {
+            osc1_wave: AtomicEnum::new(p.osc1_wave as u32),
+            osc1_level: AtomicF32::new(p.osc1_level),
+            osc1_semitones: AtomicF32::new(p.osc1_semitones),
+            osc1_detune: AtomicF32::new(p.osc1_detune),
+
+            osc2_wave: AtomicEnum::new(p.osc2_wave as u32),
+            osc2_level: AtomicF32::new(p.osc2_level),
+            osc2_semitones: AtomicF32::new(p.osc2_semitones),
+            osc2_detune: AtomicF32::new(p.osc2_detune),
+
+            pulse_width: AtomicF32::new(p.pulse_width),
+            sub_level: AtomicF32::new(p.sub_level),
+            noise_level: AtomicF32::new(p.noise_level),
+
+            filter_mode: AtomicEnum::new(p.filter_mode as u32),
+            filter_slope: AtomicEnum::new(p.filter_slope as u32),
+            cutoff: AtomicF32::new(p.cutoff),
+            resonance: AtomicF32::new(p.resonance),
+            filter_env_amount: AtomicF32::new(p.filter_env_amount),
+            filter_key_track: AtomicF32::new(p.filter_key_track),
+            filter_velocity: AtomicF32::new(p.filter_velocity),
+
+            amp_attack: AtomicF32::new(p.amp_env.attack),
+            amp_decay: AtomicF32::new(p.amp_env.decay),
+            amp_sustain: AtomicF32::new(p.amp_env.sustain),
+            amp_release: AtomicF32::new(p.amp_env.release),
+
+            filter_attack: AtomicF32::new(p.filter_env.attack),
+            filter_decay: AtomicF32::new(p.filter_env.decay),
+            filter_sustain: AtomicF32::new(p.filter_env.sustain),
+            filter_release: AtomicF32::new(p.filter_env.release),
+
+            lfo_wave: AtomicEnum::new(p.lfo_wave as u32),
+            lfo_rate: AtomicF32::new(p.lfo_rate),
+            lfo_depth: AtomicF32::new(p.lfo_depth),
+            lfo_target: AtomicEnum::new(p.lfo_target as u32),
+            lfo_retrigger: AtomicBool32::new(p.lfo_retrigger),
+
+            voice_mode: AtomicEnum::new(p.voice_mode as u32),
+            max_voices: AtomicEnum::new(p.max_voices as u32),
+            glide: AtomicF32::new(p.glide),
+            legato: AtomicBool32::new(p.legato),
+            pitch_bend: AtomicF32::new(p.pitch_bend),
+            mod_wheel: AtomicF32::new(p.mod_wheel),
+
+            master_gain: AtomicF32::new(p.master_gain),
+            drive: AtomicF32::new(p.drive),
+
+            seq_playing: AtomicBool32::new(p.seq_playing),
+            clock_source: AtomicEnum::new(p.clock_source as u32),
+            tempo: AtomicF32::new(p.tempo),
+            steps_per_beat: AtomicF32::new(p.steps_per_beat),
+            seq_length: AtomicEnum::new(p.seq_length as u32),
+            seq_gate: AtomicF32::new(p.seq_gate),
+            seq_swing: AtomicF32::new(p.seq_swing),
+
+            gen_enabled: AtomicBool32::new(p.gen_enabled),
+            gen_root: AtomicEnum::new(p.gen_root as u32),
+            gen_scale: AtomicEnum::new(p.gen_scale as u32),
+            gen_octave: AtomicEnum::new(p.gen_octave as u32),
+            gen_range: AtomicEnum::new(p.gen_range),
+            gen_density: AtomicF32::new(p.gen_density),
+            gen_max_jump: AtomicF32::new(p.gen_max_jump),
+            gen_chord_bias: AtomicF32::new(p.gen_chord_bias),
+            gen_seed: AtomicU64::new(0x5EED_1234_ABCD_0001),
+            gen_regenerate: AtomicU32::new(0),
+
+            pattern: core::array::from_fn(|_| AtomicU32::new(0)),
+
+            current_step: AtomicU32::new(0),
+            active_voices: AtomicU32::new(0),
+            output_peak: AtomicF32::new(0.0),
+        }
+    }
+
+    /// Reads every parameter into a plain struct. Called once per block by the
+    /// audio thread, and validated as it goes so no out-of-range value from the
+    /// control side can reach the DSP.
+    pub fn snapshot(&self) -> Params {
+        Params {
+            osc1_wave: Waveform::from_u32(self.osc1_wave.get()),
+            osc1_level: self.osc1_level.get().clamp(0.0, 1.0),
+            osc1_semitones: self.osc1_semitones.get().clamp(-36.0, 36.0),
+            osc1_detune: self.osc1_detune.get().clamp(-100.0, 100.0),
+
+            osc2_wave: Waveform::from_u32(self.osc2_wave.get()),
+            osc2_level: self.osc2_level.get().clamp(0.0, 1.0),
+            osc2_semitones: self.osc2_semitones.get().clamp(-36.0, 36.0),
+            osc2_detune: self.osc2_detune.get().clamp(-100.0, 100.0),
+
+            pulse_width: self.pulse_width.get().clamp(0.05, 0.95),
+            sub_level: self.sub_level.get().clamp(0.0, 1.0),
+            noise_level: self.noise_level.get().clamp(0.0, 1.0),
+
+            filter_mode: SvfMode::from_u32(self.filter_mode.get()),
+            filter_slope: Slope::from_u32(self.filter_slope.get()),
+            cutoff: self.cutoff.get().clamp(20.0, 20000.0),
+            resonance: self.resonance.get().clamp(0.0, 1.0),
+            filter_env_amount: self.filter_env_amount.get().clamp(-8.0, 8.0),
+            filter_key_track: self.filter_key_track.get().clamp(0.0, 1.0),
+            filter_velocity: self.filter_velocity.get().clamp(0.0, 1.0),
+
+            amp_env: AdsrSettings {
+                attack: self.amp_attack.get().clamp(0.0, 20.0),
+                decay: self.amp_decay.get().clamp(0.0, 20.0),
+                sustain: self.amp_sustain.get().clamp(0.0, 1.0),
+                release: self.amp_release.get().clamp(0.001, 20.0),
+            },
+            filter_env: AdsrSettings {
+                attack: self.filter_attack.get().clamp(0.0, 20.0),
+                decay: self.filter_decay.get().clamp(0.0, 20.0),
+                sustain: self.filter_sustain.get().clamp(0.0, 1.0),
+                release: self.filter_release.get().clamp(0.001, 20.0),
+            },
+
+            lfo_wave: LfoWave::from_u32(self.lfo_wave.get()),
+            lfo_rate: self.lfo_rate.get().clamp(0.01, 40.0),
+            lfo_depth: self.lfo_depth.get().clamp(0.0, 1.0),
+            lfo_target: LfoTarget::from_u32(self.lfo_target.get()),
+            lfo_retrigger: self.lfo_retrigger.get(),
+
+            voice_mode: VoiceMode::from_u32(self.voice_mode.get()),
+            max_voices: (self.max_voices.get() as usize).clamp(1, crate::MAX_VOICES),
+            glide: self.glide.get().clamp(0.0, 5.0),
+            legato: self.legato.get(),
+            pitch_bend: self.pitch_bend.get().clamp(-24.0, 24.0),
+            mod_wheel: self.mod_wheel.get().clamp(0.0, 1.0),
+
+            master_gain: self.master_gain.get().clamp(0.0, 2.0),
+            drive: self.drive.get().clamp(0.1, 20.0),
+
+            seq_playing: self.seq_playing.get(),
+            clock_source: ClockSource::from_u32(self.clock_source.get()),
+            tempo: self.tempo.get().clamp(20.0, 300.0),
+            steps_per_beat: self.steps_per_beat.get().clamp(0.25, 16.0),
+            seq_length: (self.seq_length.get() as usize).clamp(1, crate::sequencer::MAX_STEPS),
+            seq_gate: self.seq_gate.get().clamp(0.05, 2.0),
+            seq_swing: self.seq_swing.get().clamp(0.0, 0.75),
+
+            gen_enabled: self.gen_enabled.get(),
+            gen_root: (self.gen_root.get() % 12) as u8,
+            gen_scale: Scale::from_u32(self.gen_scale.get()),
+            gen_octave: (self.gen_octave.get() as i32).clamp(0, 8),
+            gen_range: self.gen_range.get().clamp(1, 5),
+            gen_density: self.gen_density.get().clamp(0.0, 1.0),
+            gen_max_jump: self.gen_max_jump.get().clamp(1.0, 12.0),
+            gen_chord_bias: self.gen_chord_bias.get().clamp(0.0, 1.0),
+        }
+    }
+
+    /// Writes a whole patch at once.
+    ///
+    /// Not atomic as a group: the audio thread may snapshot halfway through and
+    /// see a mix of old and new. That is harmless — every field is individually
+    /// valid, and the worst case is one block of a slightly wrong patch.
+    /// Blocking the audio thread to avoid it would be a far worse trade.
+    pub fn apply(&self, p: &Params) {
+        self.osc1_wave.set(p.osc1_wave as u32);
+        self.osc1_level.set(p.osc1_level);
+        self.osc1_semitones.set(p.osc1_semitones);
+        self.osc1_detune.set(p.osc1_detune);
+
+        self.osc2_wave.set(p.osc2_wave as u32);
+        self.osc2_level.set(p.osc2_level);
+        self.osc2_semitones.set(p.osc2_semitones);
+        self.osc2_detune.set(p.osc2_detune);
+
+        self.pulse_width.set(p.pulse_width);
+        self.sub_level.set(p.sub_level);
+        self.noise_level.set(p.noise_level);
+
+        self.filter_mode.set(p.filter_mode as u32);
+        self.filter_slope.set(p.filter_slope as u32);
+        self.cutoff.set(p.cutoff);
+        self.resonance.set(p.resonance);
+        self.filter_env_amount.set(p.filter_env_amount);
+        self.filter_key_track.set(p.filter_key_track);
+        self.filter_velocity.set(p.filter_velocity);
+
+        self.amp_attack.set(p.amp_env.attack);
+        self.amp_decay.set(p.amp_env.decay);
+        self.amp_sustain.set(p.amp_env.sustain);
+        self.amp_release.set(p.amp_env.release);
+
+        self.filter_attack.set(p.filter_env.attack);
+        self.filter_decay.set(p.filter_env.decay);
+        self.filter_sustain.set(p.filter_env.sustain);
+        self.filter_release.set(p.filter_env.release);
+
+        self.lfo_wave.set(p.lfo_wave as u32);
+        self.lfo_rate.set(p.lfo_rate);
+        self.lfo_depth.set(p.lfo_depth);
+        self.lfo_target.set(p.lfo_target as u32);
+        self.lfo_retrigger.set(p.lfo_retrigger);
+
+        self.voice_mode.set(p.voice_mode as u32);
+        self.max_voices.set(p.max_voices as u32);
+        self.glide.set(p.glide);
+        self.legato.set(p.legato);
+        self.pitch_bend.set(p.pitch_bend);
+        self.mod_wheel.set(p.mod_wheel);
+
+        self.master_gain.set(p.master_gain);
+        self.drive.set(p.drive);
+
+        self.seq_playing.set(p.seq_playing);
+        self.clock_source.set(p.clock_source as u32);
+        self.tempo.set(p.tempo);
+        self.steps_per_beat.set(p.steps_per_beat);
+        self.seq_length.set(p.seq_length as u32);
+        self.seq_gate.set(p.seq_gate);
+        self.seq_swing.set(p.seq_swing);
+
+        self.gen_enabled.set(p.gen_enabled);
+        self.gen_root.set(p.gen_root as u32);
+        self.gen_scale.set(p.gen_scale as u32);
+        self.gen_octave.set(p.gen_octave as u32);
+        self.gen_range.set(p.gen_range);
+        self.gen_density.set(p.gen_density);
+        self.gen_max_jump.set(p.gen_max_jump);
+        self.gen_chord_bias.set(p.gen_chord_bias);
+    }
+
+    /// Publishes one step into the mirror. Called by the audio thread.
+    pub fn publish_step(&self, index: usize, step: &crate::sequencer::Step) {
+        if index >= self.pattern.len() {
+            return;
+        }
+        // Packing: bit 31 active, bit 30 accent, bits 8-15 note, bits 0-7
+        // velocity quantised to 8 bits. Velocity to 1/255 is finer than any
+        // display or ear needs, and packing into one word is what makes the
+        // read tear-free.
+        let packed = ((step.active as u32) << 31)
+            | ((step.accent as u32) << 30)
+            | ((step.note as u32) << 8)
+            | ((step.velocity.clamp(0.0, 1.0) * 255.0) as u32);
+        self.pattern[index].store(packed, REL);
+    }
+
+    /// Reads one step back out of the mirror.
+    pub fn read_step(&self, index: usize) -> crate::sequencer::Step {
+        if index >= self.pattern.len() {
+            return crate::sequencer::Step::default();
+        }
+        let packed = self.pattern[index].load(REL);
+        crate::sequencer::Step {
+            active: packed & (1 << 31) != 0,
+            accent: packed & (1 << 30) != 0,
+            note: ((packed >> 8) & 0xFF) as u8,
+            velocity: (packed & 0xFF) as f32 / 255.0,
+        }
+    }
+
+    /// Reads the whole pattern, as far as the current length.
+    pub fn read_pattern(&self) -> crate::sequencer::Pattern {
+        let len = (self.seq_length.get() as usize).clamp(1, crate::sequencer::MAX_STEPS);
+        let steps = core::array::from_fn(|i| self.read_step(i));
+        crate::sequencer::Pattern::new(steps, len)
+    }
+
+    /// Asks the sequencer for a new generated pattern at the next boundary.
+    pub fn regenerate(&self) {
+        self.gen_regenerate.fetch_add(1, REL);
+    }
+
+    /// Reads the output peak meter and resets it, so each read reports the peak
+    /// since the previous one rather than since startup.
+    pub fn take_peak(&self) -> f32 {
+        let peak = self.output_peak.get();
+        self.output_peak.set(0.0);
+        peak
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_round_trips_a_patch() {
+        let mut p = Params::default();
+        p.cutoff = 3456.0;
+        p.resonance = 0.8;
+        p.osc1_wave = Waveform::Pulse;
+        p.voice_mode = VoiceMode::Mono;
+        p.gen_scale = Scale::Dorian;
+
+        let shared = SharedParams::default();
+        shared.apply(&p);
+        let back = shared.snapshot();
+
+        assert_eq!(back.cutoff, 3456.0);
+        assert_eq!(back.resonance, 0.8);
+        assert_eq!(back.osc1_wave, Waveform::Pulse);
+        assert_eq!(back.voice_mode, VoiceMode::Mono);
+        assert_eq!(back.gen_scale, Scale::Dorian);
+    }
+
+    /// The control side is untrusted: a UI bug or a bad patch file must not be
+    /// able to hand the DSP a negative cutoff or a NaN.
+    #[test]
+    fn snapshot_clamps_hostile_values() {
+        let shared = SharedParams::default();
+        shared.cutoff.set(-5000.0);
+        shared.resonance.set(99.0);
+        shared.max_voices.set(9999);
+        shared.tempo.set(0.0);
+
+        let p = shared.snapshot();
+        assert!(p.cutoff >= 20.0);
+        assert!(p.resonance <= 1.0);
+        assert!(p.max_voices <= crate::MAX_VOICES);
+        assert!(p.tempo >= 20.0);
+    }
+
+    #[test]
+    fn smoothed_converges_without_overshoot() {
+        let mut s = Smoothed::new(0.0, 10.0, 1500.0);
+        s.set_target(1.0);
+        let mut prev = 0.0;
+        for _ in 0..1000 {
+            let v = s.next();
+            assert!(v >= prev - 1e-6, "went backwards");
+            assert!(v <= 1.0 + 1e-6, "overshot to {v}");
+            prev = v;
+        }
+        assert!((s.value() - 1.0).abs() < 1e-4);
+    }
+
+    /// The packed mirror must survive a round trip: the UI draws from it, and a
+    /// note that comes back wrong would show the wrong pattern.
+    #[test]
+    fn the_pattern_mirror_round_trips() {
+        use crate::sequencer::Step;
+        let shared = SharedParams::default();
+
+        for (index, (active, note, velocity, accent)) in [
+            (true, 60u8, 1.0f32, true),
+            (false, 0, 0.0, false),
+            (true, 127, 0.5, false),
+            (true, 36, 0.75, true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let step = Step {
+                active,
+                note,
+                velocity,
+                accent,
+            };
+            shared.publish_step(index, &step);
+            let back = shared.read_step(index);
+
+            assert_eq!(back.active, active);
+            assert_eq!(back.note, note);
+            assert_eq!(back.accent, accent);
+            // Velocity is quantised to 8 bits on the way through.
+            assert!((back.velocity - velocity).abs() < 1.0 / 255.0 + 1e-6);
+        }
+    }
+
+    #[test]
+    fn read_pattern_respects_the_length() {
+        let shared = SharedParams::default();
+        shared.seq_length.set(8);
+        assert_eq!(shared.read_pattern().len(), 8);
+        shared.seq_length.set(64);
+        assert_eq!(shared.read_pattern().len(), 64);
+        // Out of range indices must be inert rather than panicking.
+        shared.publish_step(9999, &crate::sequencer::Step::default());
+        assert!(!shared.read_step(9999).active);
+    }
+
+    #[test]
+    fn atomic_f32_round_trips() {
+        let a = AtomicF32::new(0.0);
+        for v in [-1.5f32, 0.0, 1.0, 12345.678, f32::MIN, f32::MAX] {
+            a.set(v);
+            assert_eq!(a.get(), v);
+        }
+    }
+}
