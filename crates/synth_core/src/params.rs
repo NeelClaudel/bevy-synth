@@ -595,6 +595,14 @@ pub struct SharedParams {
     /// updated.
     pub pattern: [AtomicU32; crate::sequencer::MAX_STEPS],
 
+    /// How many of the steps above the engine has actually written.
+    ///
+    /// The mirror has to carry its own length. Sizing a read by `seq_length`
+    /// instead would let the knob promise steps the engine never published:
+    /// growing the pattern would hand the control side empty slots and a save
+    /// would store the silence.
+    pub pattern_len: AtomicU32,
+
     /// A pattern staged by the control side, waiting for the audio thread to
     /// adopt it. Packed the same way as the mirror above.
     ///
@@ -712,6 +720,7 @@ impl SharedParams {
             gen_regenerate: AtomicU32::new(0),
 
             pattern: core::array::from_fn(|_| AtomicU32::new(0)),
+            pattern_len: AtomicU32::new(p.seq_length as u32),
             pending_pattern: core::array::from_fn(|_| AtomicU32::new(0)),
             pending_length: AtomicU32::new(0),
             pending_request: AtomicU32::new(0),
@@ -907,6 +916,16 @@ impl SharedParams {
         }
     }
 
+    /// Records how many steps the mirror now holds.
+    ///
+    /// Stored after the steps themselves, so a reader that picks up the new
+    /// length has usually already seen the new data. Everything here is
+    /// `Relaxed`, so that is a tendency rather than a guarantee — the cost of
+    /// losing the race is one frame of a stale step in the grid.
+    pub fn publish_len(&self, len: usize) {
+        self.pattern_len.store(len as u32, REL);
+    }
+
     /// Reads one step back out of the mirror.
     pub fn read_step(&self, index: usize) -> crate::sequencer::Step {
         if index >= self.pattern.len() {
@@ -917,7 +936,7 @@ impl SharedParams {
 
     /// Reads the whole pattern, as far as the current length.
     pub fn read_pattern(&self) -> crate::sequencer::Pattern {
-        let len = (self.seq_length.get() as usize).clamp(1, crate::sequencer::MAX_STEPS);
+        let len = (self.pattern_len.load(REL) as usize).clamp(1, crate::sequencer::MAX_STEPS);
         let steps = core::array::from_fn(|i| self.read_step(i));
         crate::sequencer::Pattern::new(steps, len)
     }
@@ -1047,12 +1066,22 @@ mod tests {
     }
 
     #[test]
-    fn read_pattern_respects_the_length() {
+    fn read_pattern_reports_the_published_length_not_the_knob() {
         let shared = SharedParams::default();
-        shared.seq_length.set(8);
+
+        shared.publish_len(8);
         assert_eq!(shared.read_pattern().len(), 8);
-        shared.seq_length.set(64);
+        shared.publish_len(64);
         assert_eq!(shared.read_pattern().len(), 64);
+
+        // The knob is not the authority. It can promise more steps than the
+        // engine has published, and a read that believed it would hand back
+        // slots that were never written -- silence, saved into a slot as if
+        // it were music.
+        shared.seq_length.set(64);
+        shared.publish_len(8);
+        assert_eq!(shared.read_pattern().len(), 8);
+
         // Out of range indices must be inert rather than panicking.
         shared.publish_step(9999, &crate::sequencer::Step::default());
         assert!(!shared.read_step(9999).active);

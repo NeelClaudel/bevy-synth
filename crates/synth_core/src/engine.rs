@@ -441,6 +441,7 @@ impl Engine {
         for (index, step) in self.sequencer.pattern().iter().enumerate() {
             self.params.publish_step(index, step);
         }
+        self.params.publish_len(self.sequencer.pattern().len());
     }
 
     // --- Voice allocation ---
@@ -664,6 +665,70 @@ mod tests {
 
     fn peak(buffer: &[f32]) -> f32 {
         buffer.iter().fold(0.0f32, |a, &b| a.max(b.abs()))
+    }
+
+    /// A pattern longer than the default 16 has to survive being generated,
+    /// published, read back for saving, and loaded again. Any step of that
+    /// chain that assumes 16 truncates the melody.
+    #[test]
+    fn a_long_pattern_survives_the_round_trip() {
+        let (mut engine, _tx, params) = engine();
+
+        params.seq_length.set(32);
+        params.regenerate();
+        render(&mut engine, 64);
+
+        assert_eq!(engine.sequencer.pattern().len(), 32, "generated length");
+        let saved = params.read_pattern();
+        assert_eq!(saved.len(), 32, "what the UI would put in a slot");
+
+        // Now play it back, the way clicking a slot does.
+        params.seq_length.set(16);
+        params.regenerate();
+        render(&mut engine, 64);
+        params.queue_pattern(&saved);
+        render(&mut engine, 64);
+
+        assert_eq!(engine.sequencer.pattern().len(), 32, "loaded length");
+        let mirror = params.read_pattern();
+        assert_eq!(mirror.len(), 32, "mirror after loading");
+        for (i, step) in mirror.iter().enumerate() {
+            assert_eq!(step.note, saved[i].note, "step {i}");
+            assert_eq!(step.active, saved[i].active, "step {i}");
+        }
+    }
+
+    /// Growing the pattern with the Length knob, then saving, without ever
+    /// pressing Generate. The grid shows 32 steps, so a save has to hand back
+    /// the same 32 the grid is showing.
+    #[test]
+    fn growing_the_length_without_regenerating_still_saves_what_the_grid_shows() {
+        let (mut engine, _tx, params) = engine();
+
+        params.regenerate();
+        render(&mut engine, 64);
+        let short = params.read_pattern();
+        assert_eq!(short.len(), 16, "starting length");
+
+        // Drag Length to 32. No Generate.
+        params.seq_length.set(32);
+        render(&mut engine, 64);
+
+        assert_eq!(engine.sequencer.pattern().len(), 32, "sequencer grew");
+        let saved = params.read_pattern();
+        assert_eq!(saved.len(), 32, "save length");
+        for (i, step) in saved.iter().enumerate() {
+            assert_eq!(
+                step.note,
+                engine.sequencer.pattern()[i].note,
+                "step {i} note disagrees with the sequencer"
+            );
+            assert_eq!(
+                step.active,
+                engine.sequencer.pattern()[i].active,
+                "step {i} active disagrees with the sequencer"
+            );
+        }
     }
 
     /// The whole load path, end to end: the control side stages a pattern, the

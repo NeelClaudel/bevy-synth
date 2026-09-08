@@ -355,6 +355,10 @@ impl Sequencer {
             if self.position != usize::MAX && self.position >= self.length {
                 self.position = 0;
             }
+            // The steps on show changed even though none of them was edited.
+            // Without this the mirror keeps the old length and the control
+            // side reads slots the engine never published.
+            self.pattern_changed = true;
         }
 
         // Stopped, there is no bar line to wait for. Checked here rather than
