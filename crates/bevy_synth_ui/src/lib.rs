@@ -238,38 +238,79 @@ fn panel(
 
     let mut open = ui_state.open;
     egui::Window::new("Synth")
-        .default_size([1120.0, 620.0])
+        .default_size([980.0, 700.0])
+        // Keep the window inside the viewport. Without this it can open — or be
+        // dragged — mostly off-screen, with no way to get hold of it again.
+        .constrain(true)
         .open(&mut open)
         .show(ctx, |ui| {
             ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
-            transport(ui, &synth, &telemetry, &mut ui_state);
-            ui.add_space(2.0);
 
-            ui.horizontal_top(|ui| {
-                ui.vertical(|ui| {
-                    oscillators(ui, &synth);
-                    voice_section(ui, &synth);
-                });
-                ui.vertical(|ui| {
-                    filter_section(ui, &synth);
-                    envelopes(ui, &synth);
-                });
-                ui.vertical(|ui| {
-                    lfo_section(ui, &synth);
-                    presets::section(ui, &synth);
-                });
-                ui.vertical(|ui| {
-                    delay_section(ui, &synth);
-                    reverb_section(ui, &synth);
-                });
+            // Measured out here, before the scroll area. Inside one, the
+            // available width is the scrollable extent rather than the visible
+            // one, which for a horizontally scrolling area is effectively
+            // unbounded — the columns would read "everything fits" and never
+            // wrap.
+            let visible_width = ui.available_width();
+
+            // Whatever the window size, everything stays reachable. The columns
+            // reflow to fit the width; this catches what is left over, mostly
+            // height: the full panel is taller than a laptop screen.
+            egui::ScrollArea::both().show(ui, |ui| {
+                transport(ui, &synth, &telemetry, &mut ui_state);
+                ui.add_space(2.0);
+
+                synth_columns(ui, &synth, visible_width);
+
+                ui.add_space(2.0);
+                sequencer(ui, &synth, &telemetry);
+                ui.add_space(2.0);
+                keyboard(ui, &synth, &mut ui_state);
             });
-
-            ui.add_space(2.0);
-            sequencer(ui, &synth, &telemetry);
-            ui.add_space(2.0);
-            keyboard(ui, &synth, &mut ui_state);
         });
     ui_state.open = open;
+}
+
+/// The four columns of synth controls, wrapped onto as many rows as `width`
+/// allows.
+///
+/// Laid out by hand rather than with `horizontal_wrapped`, which wraps
+/// individual widgets: each column here is a `vertical` block that claims the
+/// whole remaining width as it goes, so wrapping would put every column on a
+/// row of its own no matter how wide the window was.
+fn synth_columns(ui: &mut Ui, synth: &Synth, width: f32) {
+    // About the natural width of one column of sections. It only decides how
+    // many columns fit, so guessing low is the safe direction to be wrong in:
+    // too few columns per row still fits on screen, too many does not.
+    const COLUMN_WIDTH: f32 = 265.0;
+
+    let columns: [&dyn Fn(&mut Ui); 4] = [
+        &|ui| {
+            oscillators(ui, synth);
+            voice_section(ui, synth);
+        },
+        &|ui| {
+            filter_section(ui, synth);
+            envelopes(ui, synth);
+        },
+        &|ui| {
+            lfo_section(ui, synth);
+            presets::section(ui, synth);
+        },
+        &|ui| {
+            delay_section(ui, synth);
+            reverb_section(ui, synth);
+        },
+    ];
+
+    let per_row = ((width / COLUMN_WIDTH) as usize).clamp(1, columns.len());
+    for row in columns.chunks(per_row) {
+        ui.horizontal_top(|ui| {
+            for column in row {
+                ui.vertical(|ui| column(ui));
+            }
+        });
+    }
 }
 
 fn transport(ui: &mut Ui, synth: &Synth, telemetry: &SynthTelemetry, state: &mut SynthUi) {
