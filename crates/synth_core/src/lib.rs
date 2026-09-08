@@ -29,6 +29,7 @@ pub mod engine;
 pub mod env;
 pub mod event;
 pub mod filter;
+pub mod fx;
 pub mod lfo;
 pub mod note;
 pub mod osc;
