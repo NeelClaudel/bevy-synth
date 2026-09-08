@@ -14,6 +14,7 @@
 use std::sync::Arc;
 
 use crate::event::{Consumer, Event};
+use crate::fx::FxChain;
 use crate::lfo::Lfo;
 use crate::params::{Params, SharedParams, Smoothed, VoiceMode};
 use crate::sequencer::{GenerativeSettings, Sequencer};
@@ -58,6 +59,9 @@ pub struct Engine {
     dc_x1: f32,
     dc_y1: f32,
     dc_coef: f32,
+
+    /// The effects stage: stereo delay into plate reverb.
+    fx: FxChain,
 
     /// Scratch buffer for one block of voice output.
     block: Vec<f32>,
@@ -104,6 +108,7 @@ impl Engine {
             // ~10 Hz corner: removes DC and subsonic rumble without touching
             // the bottom of the audible range.
             dc_coef: 1.0 - (2.0 * core::f32::consts::PI * 10.0 / sample_rate),
+            fx: FxChain::new(sample_rate),
             block: vec![0.0; BLOCK],
             last_voice_mode: snapshot.voice_mode,
             last_regenerate: 0,
@@ -134,6 +139,7 @@ impl Engine {
         self.dc_coef = 1.0 - (2.0 * core::f32::consts::PI * 10.0 / sample_rate);
         self.master_gain
             .set_time(15.0, sample_rate / BLOCK as f32);
+        self.fx.set_sample_rate(sample_rate);
     }
 
     /// Current sequencer pattern, for display.
@@ -143,6 +149,51 @@ impl Engine {
 
     /// Fills `out` with mono audio. This is the audio callback's entry point.
     pub fn process(&mut self, out: &mut [f32]) {
+        let params = self.begin_block();
+        let mut done = 0;
+        while done < out.len() {
+            let count = BLOCK.min(out.len() - done);
+            let mut left = [0.0f32; BLOCK];
+            let mut right = [0.0f32; BLOCK];
+            self.render_chunk(&mut left[..count], &mut right[..count], &params);
+            for (i, sample) in out[done..done + count].iter_mut().enumerate() {
+                // Sum to mono. When the effects are off the two channels are
+                // bit-identical, and `(x + x) * 0.5` is exact in IEEE-754, so
+                // this path does not disturb a dry signal.
+                *sample = (left[i] + right[i]) * 0.5;
+            }
+            done += count;
+        }
+        self.publish_telemetry();
+    }
+
+    /// Fills an interleaved stereo buffer. The channels diverge only where the
+    /// effects stage puts something in them.
+    pub fn process_stereo_interleaved(&mut self, out: &mut [f32]) {
+        let params = self.begin_block();
+        let frames = out.len() / 2;
+        let mut done = 0;
+        while done < frames {
+            let count = BLOCK.min(frames - done);
+            let mut left = [0.0f32; BLOCK];
+            let mut right = [0.0f32; BLOCK];
+            self.render_chunk(&mut left[..count], &mut right[..count], &params);
+            for (i, frame) in out[done * 2..(done + count) * 2]
+                .chunks_exact_mut(2)
+                .enumerate()
+            {
+                frame[0] = left[i];
+                frame[1] = right[i];
+            }
+            done += count;
+        }
+        self.publish_telemetry();
+    }
+
+    /// Everything that happens once per `process` call, before any audio:
+    /// take the parameter snapshot, handle a mode switch, drain the event
+    /// queue. Returns the snapshot the whole call will use.
+    fn begin_block(&mut self) -> Params {
         let params = self.params.snapshot();
 
         // Handle a mono/poly switch first. Doing it after draining events would
@@ -157,85 +208,69 @@ impl Engine {
 
         self.drain_events(&params);
 
+        self.lfo.set_rate(params.lfo_rate);
+        self.master_gain.set_target(params.master_gain);
+
+        params
+    }
+
+    /// Renders one chunk of at most `BLOCK` samples into two channels.
+    ///
+    /// Mono up to and including the DC blocker, stereo from the effects on.
+    fn render_chunk(&mut self, left: &mut [f32], right: &mut [f32], params: &Params) {
+        let count = left.len().min(right.len());
+
+        let seq = self.sequencer.advance(count, params);
+        if let Some(note) = seq.note_off {
+            self.note_off(note, params);
+        }
+        if let Some((note, velocity)) = seq.note_on {
+            self.note_on(note, velocity, params);
+        }
+
+        let lfo = self.lfo.next_block(params.lfo_wave, count);
+
         // The LFO knob and the mod wheel add, so a patch can be static until
         // the player asks for movement, and the wheel can always reach full
         // depth regardless of where the knob sits.
         let mod_depth = (params.lfo_depth + params.mod_wheel).min(1.0);
-        self.lfo.set_rate(params.lfo_rate);
-        self.master_gain.set_target(params.master_gain);
 
-        for chunk in out.chunks_mut(BLOCK) {
-            let len = chunk.len();
-
-            let seq = self.sequencer.advance(len, &params);
-            if let Some(note) = seq.note_off {
-                self.note_off(note, &params);
-            }
-            if let Some((note, velocity)) = seq.note_on {
-                self.note_on(note, velocity, &params);
-            }
-
-            let lfo = self.lfo.next_block(params.lfo_wave, len);
-
-            let block = &mut self.block[..len];
-            block.fill(0.0);
-            for voice in self.voices.iter_mut().take(params.max_voices) {
-                voice.process_block(block, &params, lfo, mod_depth);
-            }
-
-            let gain = self.master_gain.next();
-
-            // The DC blocker's state lives in locals for the length of the
-            // loop: `self.block` is already borrowed, and copying two floats in
-            // and out beats splitting the struct.
-            let (mut dc_x1, mut dc_y1, dc_coef) = (self.dc_x1, self.dc_y1, self.dc_coef);
-            let mut peak = self.peak;
-
-            for (dst, &src) in chunk.iter_mut().zip(block.iter()) {
-                // Drive into the soft clipper, then out at master gain. Pushing
-                // the clipper is what gives the synth teeth; below 1.0 it stays
-                // clean.
-                let driven = soft_clip(src * params.drive);
-
-                let blocked = driven - dc_x1 + dc_coef * dc_y1;
-                dc_x1 = driven;
-                dc_y1 = blocked;
-
-                let value = blocked * gain;
-                let value = if value.is_finite() {
-                    value.clamp(-1.0, 1.0)
-                } else {
-                    // A NaN reaching the driver is a loud, ugly failure. It
-                    // should be impossible, but silence is the right answer if
-                    // it ever happens.
-                    0.0
-                };
-                peak = peak.max(value.abs());
-                *dst = value;
-            }
-
-            self.dc_x1 = dc_x1;
-            self.dc_y1 = dc_y1;
-            self.peak = peak;
+        let block = &mut self.block[..count];
+        block.fill(0.0);
+        for voice in self.voices.iter_mut().take(params.max_voices) {
+            voice.process_block(block, params, lfo, mod_depth);
         }
 
-        self.publish_telemetry();
-    }
+        let gain = self.master_gain.next();
 
-    /// Fills an interleaved stereo buffer with the same signal on both channels.
-    pub fn process_stereo_interleaved(&mut self, out: &mut [f32]) {
-        // Render mono into the first half, then expand in place from the back
-        // so the read and write cursors never collide.
-        let frames = out.len() / 2;
-        for chunk_start in (0..frames).step_by(BLOCK) {
-            let n = BLOCK.min(frames - chunk_start);
-            let mut mono = [0.0f32; BLOCK];
-            self.process(&mut mono[..n]);
-            let frames = &mut out[chunk_start * 2..(chunk_start + n) * 2];
-            for (frame, &sample) in frames.chunks_exact_mut(2).zip(mono.iter()) {
-                frame[0] = sample;
-                frame[1] = sample;
-            }
+        for i in 0..count {
+            // Drive into the soft clipper, then out at master gain. Pushing
+            // the clipper is what gives the synth teeth; below 1.0 it stays
+            // clean.
+            let driven = soft_clip(self.block[i] * params.drive);
+            let blocked = driven - self.dc_x1 + self.dc_coef * self.dc_y1;
+            self.dc_x1 = driven;
+            self.dc_y1 = blocked;
+            left[i] = blocked;
+            right[i] = blocked;
+        }
+
+        // The clock, not `params.tempo`: when an external MIDI clock is
+        // driving the sequencer, that is the tempo the delay must lock to.
+        let tempo = self.sequencer.clock.tempo_bpm(params.steps_per_beat);
+        self.fx
+            .process_block(&mut left[..count], &mut right[..count], params, tempo);
+
+        for i in 0..count {
+            let l = left[i] * gain;
+            let r = right[i] * gain;
+            // A NaN reaching the driver is a loud, ugly failure. It should be
+            // impossible, but silence is the right answer if it ever happens.
+            let l = if l.is_finite() { l.clamp(-1.0, 1.0) } else { 0.0 };
+            let r = if r.is_finite() { r.clamp(-1.0, 1.0) } else { 0.0 };
+            self.peak = self.peak.max(l.abs()).max(r.abs());
+            left[i] = l;
+            right[i] = r;
         }
     }
 
@@ -898,6 +933,93 @@ mod tests {
             assert_eq!(frame[0], frame[1], "channels diverged");
         }
         assert!(peak(&stereo) > 0.0);
+    }
+
+    #[test]
+    fn the_reverb_makes_the_output_stereo() {
+        let (mut e, tx, params) = engine();
+        params.seq_playing.set(false);
+        params.reverb_mix.set(0.8);
+        params.reverb_size.set(0.8);
+        params.reverb_width.set(1.0);
+        tx.push(Event::NoteOn {
+            note: 60,
+            velocity: 0.8,
+        });
+
+        let mut out = vec![0.0; 8192];
+        e.process_stereo_interleaved(&mut out);
+
+        let differing = out
+            .chunks_exact(2)
+            .filter(|frame| (frame[0] - frame[1]).abs() > 1e-6)
+            .count();
+        assert!(differing > 1000, "only {differing} frames differed");
+    }
+
+    #[test]
+    fn the_dry_output_is_still_mono() {
+        let (mut e, tx, params) = engine();
+        params.seq_playing.set(false);
+        tx.push(Event::NoteOn {
+            note: 60,
+            velocity: 0.8,
+        });
+
+        let mut out = vec![0.0; 4096];
+        e.process_stereo_interleaved(&mut out);
+
+        for (i, frame) in out.chunks_exact(2).enumerate() {
+            assert_eq!(frame[0], frame[1], "frame {i} was not mono");
+        }
+    }
+
+    #[test]
+    fn the_delay_survives_the_engines_output_stage() {
+        let (mut e, tx, params) = engine();
+        params.seq_playing.set(false);
+        params.delay_mix.set(0.8);
+        params.delay_time.set(0.2);
+        params.delay_feedback.set(0.6);
+        tx.push(Event::NoteOn {
+            note: 60,
+            velocity: 1.0,
+        });
+
+        let mut out = render(&mut e, 4800);
+        tx.push(Event::NoteOff { note: 60 });
+        out.extend(render(&mut e, 43200));
+
+        // The note stopped a tenth of a second in; anything still audible at
+        // half a second is the delay.
+        let late: f32 = out[24000..].iter().map(|s| s.abs()).sum();
+        assert!(late > 1.0, "no repeats after the note ended: {late}");
+    }
+
+    #[test]
+    fn a_wet_patch_still_respects_the_output_limits() {
+        let (mut e, tx, params) = engine();
+        params.seq_playing.set(false);
+        params.drive.set(4.0);
+        params.delay_mix.set(1.0);
+        params.delay_feedback.set(0.95);
+        params.delay_time.set(0.01);
+        params.reverb_mix.set(1.0);
+        params.reverb_size.set(1.0);
+        params.reverb_damping.set(0.0);
+
+        for note in 40..56 {
+            tx.push(Event::NoteOn {
+                note,
+                velocity: 1.0,
+            });
+        }
+
+        let out = render(&mut e, 48000 * 4);
+        for (i, sample) in out.iter().enumerate() {
+            assert!(sample.is_finite(), "sample {i} was {sample}");
+            assert!(sample.abs() <= 1.0, "sample {i} was {sample}");
+        }
     }
 
     /// FNV-1a over the raw bits of every sample.
