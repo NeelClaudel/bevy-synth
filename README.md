@@ -89,6 +89,23 @@ note and starts the new one rather than retriggering), a peak meter with a
 slow-falling hold, and eight presets. Presets set the *patch* only and leave
 tempo, key and pattern alone: those belong to the piece, not the sound.
 
+The delay and reverb parameters, with their ranges and defaults:
+
+| Parameter | Range | Default | What it does |
+| --- | --- | --- | --- |
+| Delay mix | 0.0–1.0 | 0.0 | Dry/wet. 0.0 bypasses the delay entirely. |
+| Delay sync | on/off | off | Take the time from the sequencer clock instead of the Time knob. |
+| Delay time | 0.001–2.0 s | 0.375 s | Free-running repeat interval. |
+| Delay division | 1/1–1/16T | 1/8 | Repeat interval in musical time, used when sync is on. |
+| Delay feedback | 0.0–0.95 | 0.35 | How much of each repeat feeds the next. |
+| Delay damping | 0.0–1.0 | 0.3 | High-frequency loss per repeat. Bright digital to dark tape. |
+| Ping pong | on/off | off | Repeats alternate between the speakers. |
+| Reverb mix | 0.0–1.0 | 0.0 | Dry/wet. 0.0 bypasses the reverb entirely. |
+| Reverb size | 0.0–1.0 | 0.5 | Tail length. |
+| Reverb damping | 0.0–1.0 | 0.5 | High-frequency absorption in the tank. |
+| Pre-delay | 0.0–0.25 s | 0.02 s | Gap before the tail starts. This is what reads as room size. |
+| Reverb width | 0.0–1.0 | 1.0 | 0.0 collapses the tail to mono, 1.0 is the full spread. |
+
 ### How the UI sees the pattern without a lock
 
 The pattern lives inside the sequencer on the audio thread. Rather than lock it,
@@ -110,9 +127,17 @@ bevy_synth_ui  the egui control panel. Optional — the synth does not need it.
 ```
 
 `synth_core` has no dependencies whatsoever, which is what makes it testable:
-81 tests run the DSP offline, in under a second, with no audio device.
+126 tests run the DSP offline, in under a second, with no audio device.
 
 ## Where each feature lives
+
+```
+voices -> drive -> soft clip -> DC block -> delay -> reverb -> master gain -> NaN guard
+```
+
+The chain is mono up to the delay and stereo after it — the reverb's stereo
+image comes from tapping a single shared tank at different points, rather
+than from running two reverbs side by side.
 
 | What you asked for | Where | Notes |
 |---|---|---|
@@ -186,10 +211,13 @@ a silent app, not a crash. Games run on machines with no audio, and in CI.
 
 The obvious next moves, roughly in order of value per line of code:
 
-- **Effects.** A delay and a reverb do more for the sound than any further
-  oscillator work. Both belong after the voice sum, in `Engine::process`.
-- **Stereo.** Per-voice panning, spread across the keyboard or randomised. The
-  engine is mono today and `process_stereo_interleaved` just duplicates.
+- **Chorus and phaser.** Both fall out of the delay line primitive that is
+  already there.
+- **A distortion stage.** Separate from the drive control, for more character
+  than drive alone gives.
+- **Per-voice panning.** So the stereo field starts before the effects rather
+  than at them.
+- **User-reorderable effects.** Worth having once there are more than two.
 - **Patch save/load.** `Params` is plain data; derive `Serialize` on it and you
   have patch files.
 - **Unison.** Several detuned voices per note. The voice allocator already has
