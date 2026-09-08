@@ -42,6 +42,9 @@ pub mod palette {
     pub const LFO: Color32 = Color32::from_rgb(214, 150, 255);
     /// Sequencer and generator.
     pub const SEQ: Color32 = Color32::from_rgb(255, 122, 140);
+    /// Effects. Teal — cool and wet against the warm oscillator and filter
+    /// sections, which is roughly what the stage does to the sound.
+    pub const FX: Color32 = Color32::from_rgb(94, 224, 208);
 
     pub const ACCENT: Color32 = Color32::from_rgb(255, 214, 102);
     pub const DANGER: Color32 = Color32::from_rgb(255, 96, 96);

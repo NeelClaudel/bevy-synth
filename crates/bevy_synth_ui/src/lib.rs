@@ -38,7 +38,7 @@ use synth_core::env::AdsrSettings;
 use synth_core::filter::{Slope, SvfMode};
 use synth_core::lfo::{LfoTarget, LfoWave};
 use synth_core::params::{AtomicEnum, ClockSource, VoiceMode};
-use synth_core::{Scale, Waveform};
+use synth_core::{NoteDivision, Scale, Waveform};
 
 pub mod presets;
 pub mod widgets;
@@ -140,6 +140,7 @@ ui_enum!(SvfMode, &SvfMode::ALL, |m: SvfMode| m.name());
 ui_enum!(LfoWave, &LfoWave::ALL, |w: LfoWave| w.name());
 ui_enum!(LfoTarget, &LfoTarget::ALL, |t: LfoTarget| t.name());
 ui_enum!(Scale, &Scale::ALL, |s: Scale| s.name());
+ui_enum!(NoteDivision, &NoteDivision::ALL, |d: NoteDivision| d.name());
 ui_enum!(
     Slope,
     &[Slope::Db12, Slope::Db24],
@@ -237,7 +238,7 @@ fn panel(
 
     let mut open = ui_state.open;
     egui::Window::new("Synth")
-        .default_size([880.0, 620.0])
+        .default_size([1120.0, 620.0])
         .open(&mut open)
         .show(ctx, |ui| {
             ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
@@ -256,6 +257,10 @@ fn panel(
                 ui.vertical(|ui| {
                     lfo_section(ui, &synth);
                     presets::section(ui, &synth);
+                });
+                ui.vertical(|ui| {
+                    delay_section(ui, &synth);
+                    reverb_section(ui, &synth);
                 });
             });
 
@@ -668,6 +673,128 @@ fn lfo_section(ui: &mut Ui, synth: &Synth) {
         {
             p.lfo_retrigger.set(retrigger);
         }
+    });
+}
+
+fn delay_section(ui: &mut Ui, synth: &Synth) {
+    let p = &synth.params;
+    widgets::section(ui, "DELAY", palette::FX, |ui| {
+        let mut sync = p.delay_sync.get();
+        if ui
+            .checkbox(&mut sync, "Sync to tempo")
+            .on_hover_text("Lock the repeats to the sequencer clock, internal or MIDI")
+            .changed()
+        {
+            p.delay_sync.set(sync);
+        }
+
+        ui.horizontal(|ui| {
+            // Time and Division share one slot: only one of them is doing
+            // anything at a time, and showing both invites the user to set the
+            // one that is being ignored.
+            if sync {
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new("Division")
+                            .size(10.0)
+                            .color(palette::TEXT_DIM),
+                    );
+                    dropdown::<NoteDivision>(ui, "delay_division", &p.delay_division);
+                });
+            } else {
+                widgets::knob_param(
+                    ui,
+                    &KnobSpec::new("Time", 0.001..=2.0)
+                        .log()
+                        .colour(palette::FX)
+                        .unit("s")
+                        .default(0.375),
+                    &p.delay_time,
+                );
+            }
+
+            widgets::knob_param(
+                ui,
+                &KnobSpec::new("Feedback", 0.0..=0.95)
+                    .colour(palette::FX)
+                    .default(0.35),
+                &p.delay_feedback,
+            );
+        });
+
+        ui.horizontal(|ui| {
+            widgets::knob_param(
+                ui,
+                &KnobSpec::new("Damping", 0.0..=1.0)
+                    .colour(palette::FX)
+                    .default(0.3),
+                &p.delay_damping,
+            );
+            widgets::knob_param(
+                ui,
+                &KnobSpec::new("Mix", 0.0..=1.0)
+                    .colour(palette::FX)
+                    .default(0.0),
+                &p.delay_mix,
+            );
+        });
+
+        let mut ping_pong = p.delay_ping_pong.get();
+        if ui
+            .checkbox(&mut ping_pong, "Ping pong")
+            .on_hover_text("Repeats alternate between the speakers")
+            .changed()
+        {
+            p.delay_ping_pong.set(ping_pong);
+        }
+    });
+}
+
+fn reverb_section(ui: &mut Ui, synth: &Synth) {
+    let p = &synth.params;
+    widgets::section(ui, "REVERB", palette::FX, |ui| {
+        ui.horizontal(|ui| {
+            widgets::knob_param(
+                ui,
+                &KnobSpec::new("Size", 0.0..=1.0)
+                    .colour(palette::FX)
+                    .default(0.5),
+                &p.reverb_size,
+            );
+            widgets::knob_param(
+                ui,
+                &KnobSpec::new("Damping", 0.0..=1.0)
+                    .colour(palette::FX)
+                    .default(0.5),
+                &p.reverb_damping,
+            );
+        });
+
+        ui.horizontal(|ui| {
+            widgets::knob_param(
+                ui,
+                &KnobSpec::new("Pre-delay", 0.0..=0.25)
+                    .colour(palette::FX)
+                    .unit("s")
+                    .default(0.02),
+                &p.reverb_predelay,
+            );
+            widgets::knob_param(
+                ui,
+                &KnobSpec::new("Width", 0.0..=1.0)
+                    .colour(palette::FX)
+                    .default(1.0),
+                &p.reverb_width,
+            );
+        });
+
+        widgets::knob_param(
+            ui,
+            &KnobSpec::new("Mix", 0.0..=1.0)
+                .colour(palette::FX)
+                .default(0.0),
+            &p.reverb_mix,
+        );
     });
 }
 
