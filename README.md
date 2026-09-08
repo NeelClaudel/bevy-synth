@@ -199,6 +199,3 @@ The obvious next moves, roughly in order of value per line of code:
 ## Licence
 
 MIT OR Apache-2.0.
-#   b e v y - s y n t h 
- 
- 
