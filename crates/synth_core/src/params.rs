@@ -31,11 +31,33 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::env::AdsrSettings;
 use crate::filter::{Slope, SvfMode};
+use crate::fx::NoteDivision;
 use crate::lfo::{LfoTarget, LfoWave};
 use crate::osc::Waveform;
 use crate::scale::Scale;
 
 const REL: Ordering = Ordering::Relaxed;
+
+/// Clamps to `0.0..=1.0`, mapping NaN to 0.0.
+///
+/// `f32::clamp` propagates a NaN input, so a bare `.clamp(0.0, 1.0)` is not
+/// enough for a value that arrived over an atomic from another thread.
+fn clamp01(value: f32) -> f32 {
+    if value.is_nan() {
+        0.0
+    } else {
+        value.clamp(0.0, 1.0)
+    }
+}
+
+/// Replaces a non-finite value with a fallback, leaving finite ones alone.
+fn sane(value: f32, fallback: f32) -> f32 {
+    if value.is_finite() {
+        value
+    } else {
+        fallback
+    }
+}
 
 /// An `f32` stored atomically, via its bit pattern.
 ///
@@ -288,6 +310,36 @@ pub struct Params {
     /// saturation rather than clean gain.
     pub drive: f32,
 
+    // --- Delay ---
+    /// Dry/wet blend for the delay. 0.0 bypasses it entirely.
+    pub delay_mix: f32,
+    /// When true, `delay_division` sets the time and `delay_time` is ignored.
+    pub delay_sync: bool,
+    /// Free-running delay time in seconds.
+    pub delay_time: f32,
+    /// Delay time as a musical division, used when `delay_sync` is set.
+    pub delay_division: NoteDivision,
+    /// How much of each repeat feeds the next. Below 1.0 always.
+    pub delay_feedback: f32,
+    /// High-frequency loss per repeat. 0.0 is a bright digital delay, 1.0 a
+    /// dark tape one.
+    pub delay_damping: f32,
+    /// Cross the two lines so repeats alternate between the speakers.
+    pub delay_ping_pong: bool,
+
+    // --- Reverb ---
+    /// Dry/wet blend for the reverb. 0.0 bypasses it entirely.
+    pub reverb_mix: f32,
+    /// Tail length, as a fraction of the tank's decay range.
+    pub reverb_size: f32,
+    /// High-frequency absorption inside the tank.
+    pub reverb_damping: f32,
+    /// Gap before the tail starts, in seconds. This is what makes a space
+    /// sound large rather than just long.
+    pub reverb_predelay: f32,
+    /// 0.0 collapses the tail to mono, 1.0 is the full tap spread.
+    pub reverb_width: f32,
+
     // --- Sequencer ---
     pub seq_playing: bool,
     pub clock_source: ClockSource,
@@ -378,6 +430,20 @@ impl Default for Params {
             master_gain: 0.5,
             drive: 1.0,
 
+            delay_mix: 0.0,
+            delay_sync: false,
+            delay_time: 0.375,
+            delay_division: NoteDivision::Eighth,
+            delay_feedback: 0.35,
+            delay_damping: 0.3,
+            delay_ping_pong: false,
+
+            reverb_mix: 0.0,
+            reverb_size: 0.5,
+            reverb_damping: 0.5,
+            reverb_predelay: 0.02,
+            reverb_width: 1.0,
+
             seq_playing: false,
             clock_source: ClockSource::Internal,
             tempo: 120.0,
@@ -453,6 +519,20 @@ pub struct SharedParams {
     pub master_gain: AtomicF32,
     pub drive: AtomicF32,
 
+    pub delay_mix: AtomicF32,
+    pub delay_sync: AtomicBool32,
+    pub delay_time: AtomicF32,
+    pub delay_division: AtomicEnum,
+    pub delay_feedback: AtomicF32,
+    pub delay_damping: AtomicF32,
+    pub delay_ping_pong: AtomicBool32,
+
+    pub reverb_mix: AtomicF32,
+    pub reverb_size: AtomicF32,
+    pub reverb_damping: AtomicF32,
+    pub reverb_predelay: AtomicF32,
+    pub reverb_width: AtomicF32,
+
     pub seq_playing: AtomicBool32,
     pub clock_source: AtomicEnum,
     pub tempo: AtomicF32,
@@ -495,13 +575,13 @@ pub struct SharedParams {
 
 impl Default for SharedParams {
     fn default() -> Self {
-        Self::from_params(Params::default())
+        Self::from_params(&Params::default())
     }
 }
 
 impl SharedParams {
     /// Builds a shared block from a plain snapshot. This is how patches load.
-    pub fn from_params(p: Params) -> Self {
+    pub fn from_params(p: &Params) -> Self {
         Self {
             osc1_wave: AtomicEnum::new(p.osc1_wave as u32),
             osc1_level: AtomicF32::new(p.osc1_level),
@@ -550,6 +630,20 @@ impl SharedParams {
 
             master_gain: AtomicF32::new(p.master_gain),
             drive: AtomicF32::new(p.drive),
+
+            delay_mix: AtomicF32::new(p.delay_mix),
+            delay_sync: AtomicBool32::new(p.delay_sync),
+            delay_time: AtomicF32::new(p.delay_time),
+            delay_division: AtomicEnum::new(p.delay_division as u32),
+            delay_feedback: AtomicF32::new(p.delay_feedback),
+            delay_damping: AtomicF32::new(p.delay_damping),
+            delay_ping_pong: AtomicBool32::new(p.delay_ping_pong),
+
+            reverb_mix: AtomicF32::new(p.reverb_mix),
+            reverb_size: AtomicF32::new(p.reverb_size),
+            reverb_damping: AtomicF32::new(p.reverb_damping),
+            reverb_predelay: AtomicF32::new(p.reverb_predelay),
+            reverb_width: AtomicF32::new(p.reverb_width),
 
             seq_playing: AtomicBool32::new(p.seq_playing),
             clock_source: AtomicEnum::new(p.clock_source as u32),
@@ -634,6 +728,22 @@ impl SharedParams {
             master_gain: self.master_gain.get().clamp(0.0, 2.0),
             drive: self.drive.get().clamp(0.1, 20.0),
 
+            delay_mix: clamp01(self.delay_mix.get()),
+            delay_sync: self.delay_sync.get(),
+            delay_time: sane(self.delay_time.get(), 0.375).clamp(0.001, 2.0),
+            delay_division: NoteDivision::from_u32(self.delay_division.get()),
+            // Strictly below 1.0. At 1.0 the loop is a perfect integrator and
+            // the repeats never stop.
+            delay_feedback: clamp01(self.delay_feedback.get()).min(0.95),
+            delay_damping: clamp01(self.delay_damping.get()),
+            delay_ping_pong: self.delay_ping_pong.get(),
+
+            reverb_mix: clamp01(self.reverb_mix.get()),
+            reverb_size: clamp01(self.reverb_size.get()),
+            reverb_damping: clamp01(self.reverb_damping.get()),
+            reverb_predelay: sane(self.reverb_predelay.get(), 0.02).clamp(0.0, 0.25),
+            reverb_width: clamp01(self.reverb_width.get()),
+
             seq_playing: self.seq_playing.get(),
             clock_source: ClockSource::from_u32(self.clock_source.get()),
             tempo: self.tempo.get().clamp(20.0, 300.0),
@@ -707,6 +817,20 @@ impl SharedParams {
 
         self.master_gain.set(p.master_gain);
         self.drive.set(p.drive);
+
+        self.delay_mix.set(p.delay_mix);
+        self.delay_sync.set(p.delay_sync);
+        self.delay_time.set(p.delay_time);
+        self.delay_division.set(p.delay_division as u32);
+        self.delay_feedback.set(p.delay_feedback);
+        self.delay_damping.set(p.delay_damping);
+        self.delay_ping_pong.set(p.delay_ping_pong);
+
+        self.reverb_mix.set(p.reverb_mix);
+        self.reverb_size.set(p.reverb_size);
+        self.reverb_damping.set(p.reverb_damping);
+        self.reverb_predelay.set(p.reverb_predelay);
+        self.reverb_width.set(p.reverb_width);
 
         self.seq_playing.set(p.seq_playing);
         self.clock_source.set(p.clock_source as u32);
@@ -884,5 +1008,77 @@ mod tests {
             a.set(v);
             assert_eq!(a.get(), v);
         }
+    }
+
+    #[test]
+    fn the_effects_default_to_silent() {
+        let params = Params::default();
+        // A patch nobody has touched must sound exactly as it did before the
+        // effects existed. Zero mix on both is what guarantees that.
+        assert_eq!(params.delay_mix, 0.0);
+        assert_eq!(params.reverb_mix, 0.0);
+    }
+
+    #[test]
+    fn effect_parameters_survive_a_round_trip() {
+        let mut params = Params::default();
+        params.delay_mix = 0.4;
+        params.delay_sync = true;
+        params.delay_time = 0.25;
+        params.delay_division = NoteDivision::QuarterDot;
+        params.delay_feedback = 0.6;
+        params.delay_damping = 0.7;
+        params.delay_ping_pong = true;
+        params.reverb_mix = 0.3;
+        params.reverb_size = 0.9;
+        params.reverb_damping = 0.2;
+        params.reverb_predelay = 0.05;
+        params.reverb_width = 0.8;
+
+        let shared = SharedParams::from_params(&params);
+        let back = shared.snapshot();
+
+        assert_eq!(back.delay_mix, 0.4);
+        assert!(back.delay_sync);
+        assert_eq!(back.delay_time, 0.25);
+        assert_eq!(back.delay_division, NoteDivision::QuarterDot);
+        assert_eq!(back.delay_feedback, 0.6);
+        assert_eq!(back.delay_damping, 0.7);
+        assert!(back.delay_ping_pong);
+        assert_eq!(back.reverb_mix, 0.3);
+        assert_eq!(back.reverb_size, 0.9);
+        assert_eq!(back.reverb_damping, 0.2);
+        assert_eq!(back.reverb_predelay, 0.05);
+        assert_eq!(back.reverb_width, 0.8);
+
+        // `apply` writes back into the same atomics.
+        let blank = SharedParams::from_params(&Params::default());
+        blank.apply(&params);
+        assert_eq!(blank.snapshot().delay_feedback, 0.6);
+        assert_eq!(blank.snapshot().reverb_size, 0.9);
+    }
+
+    #[test]
+    fn effect_parameters_are_clamped_on_the_way_out() {
+        let shared = SharedParams::from_params(&Params::default());
+        shared.delay_mix.set(9.0);
+        shared.delay_time.set(-1.0);
+        shared.delay_feedback.set(2.0);
+        shared.delay_damping.set(-0.5);
+        shared.reverb_mix.set(f32::NAN);
+        shared.reverb_size.set(50.0);
+        shared.reverb_predelay.set(10.0);
+        shared.reverb_width.set(-3.0);
+
+        let params = shared.snapshot();
+        assert_eq!(params.delay_mix, 1.0);
+        assert_eq!(params.delay_time, 0.001);
+        // Strictly below 1.0: at 1.0 the feedback loop never decays.
+        assert!(params.delay_feedback <= 0.95);
+        assert_eq!(params.delay_damping, 0.0);
+        assert!(params.reverb_mix.is_finite());
+        assert_eq!(params.reverb_size, 1.0);
+        assert_eq!(params.reverb_predelay, 0.25);
+        assert_eq!(params.reverb_width, 0.0);
     }
 }
