@@ -6,7 +6,9 @@
 //! no resampler in sight.
 
 pub mod pattern;
+mod sequencer;
 pub mod voice;
 
 pub use pattern::{pack_column, unpack_column, Cell, Column, DrumPattern};
+pub use sequencer::{DrumOutput, DrumSequencer};
 pub use voice::{Decay, DrumVoice, Pad, PAD_COUNT};
