@@ -461,7 +461,11 @@ mod tests {
     /// thread, where a panic is the one unsurvivable outcome.
     #[test]
     fn the_first_tick_before_any_block_does_not_index_an_empty_grid() {
-        let p = Params { drum_enabled: true, clock_source: ClockSource::ExternalMidi, ..Default::default() };
+        let p = Params {
+            drum_enabled: true,
+            clock_source: ClockSource::ExternalMidi,
+            ..Default::default()
+        };
         let c = running_clock(&p);
         let mut s = DrumSequencer::new();
 
@@ -475,7 +479,11 @@ mod tests {
     /// unread until something happened to call `advance`.
     #[test]
     fn a_length_change_reaches_the_grid_through_the_tick_path() {
-        let mut p = Params { drum_length: 4, clock_source: ClockSource::ExternalMidi, ..Default::default() };
+        let mut p = Params {
+            drum_length: 4,
+            clock_source: ClockSource::ExternalMidi,
+            ..Default::default()
+        };
         let c = running_clock(&p);
         let mut s = DrumSequencer::new();
         for _ in 0..4 {
