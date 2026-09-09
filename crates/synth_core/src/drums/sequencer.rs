@@ -145,6 +145,12 @@ impl DrumSequencer {
     /// The external-clock path: one tick is one step.
     pub fn on_tick(&mut self, ticked: bool, clock: ClockView, p: &Params) -> DrumOutput {
         let mut out = DrumOutput::default();
+        // Same first move as `advance`, and for the same two reasons. The
+        // length knob has to reach the grid on this path too — under an
+        // external clock no block ever calls `advance` — and until it does the
+        // pattern is `DrumPattern::default()`, whose length is zero: `step`
+        // would index an empty slice, on the audio thread.
+        self.reconcile_length(p);
         if ticked {
             self.step(clock, p, &mut out);
         }
@@ -392,5 +398,40 @@ mod tests {
             steps += usize::from(d.stepped);
         }
         assert!(steps > 0, "no MIDI tick ever produced a step");
+    }
+
+    /// A first-ever tick, before any block has rendered. `DrumPattern::default`
+    /// starts at length zero and only `advance` reconciled the length knob, so
+    /// under an external clock the very first `ClockTick` — `ClockStart` then
+    /// `ClockTick` inside one event burst, before `render` ever runs — reached
+    /// `step` with an empty pattern and indexed an empty slice. On the audio
+    /// thread, where a panic is the one unsurvivable outcome.
+    #[test]
+    fn the_first_tick_before_any_block_does_not_index_an_empty_grid() {
+        let p = Params { drum_enabled: true, clock_source: ClockSource::ExternalMidi, ..Default::default() };
+        let c = running_clock(&p);
+        let mut s = DrumSequencer::new();
+
+        let out = s.on_tick(true, c.view(), &p);
+        assert!(out.stepped, "the tick should still have stepped");
+        assert_eq!(s.position(), 0);
+    }
+
+    /// The length knob has to reach the grid on the tick path too, not only
+    /// when a block renders: under an external clock a knob move otherwise sat
+    /// unread until something happened to call `advance`.
+    #[test]
+    fn a_length_change_reaches_the_grid_through_the_tick_path() {
+        let mut p = Params { drum_length: 4, clock_source: ClockSource::ExternalMidi, ..Default::default() };
+        let c = running_clock(&p);
+        let mut s = DrumSequencer::new();
+        for _ in 0..4 {
+            s.on_tick(true, c.view(), &p);
+        }
+        assert_eq!(s.grid().len(), 4);
+
+        p.drum_length = 8;
+        s.on_tick(true, c.view(), &p);
+        assert_eq!(s.grid().len(), 8, "the knob never reached the grid");
     }
 }
