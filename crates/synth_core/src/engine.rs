@@ -787,18 +787,32 @@ mod tests {
         buffer.iter().fold(0.0f32, |a, &b| a.max(b.abs()))
     }
 
-    /// The bypass, stated as a test: an engine that has never been told about
-    /// drums must render exactly what it rendered before drums existed.
+    /// The bypass, stated as a test. Two engines rendering the same melody,
+    /// one with the rack switched off and one with it switched on over an
+    /// empty grid: the second sequences a whole run of columns and strikes
+    /// nothing, so `render` returns false and the engine never mixes the bus.
+    /// Bit-identical output is the claim, and it is the claim the golden
+    /// vector rests on.
+    ///
+    /// Comparing two drums-off engines instead — which is what this test used
+    /// to do under a name promising more — only shows that the engine is
+    /// deterministic.
     #[test]
-    fn drums_off_leaves_the_output_untouched() {
-        let (mut a, _tx_a, params_a) = engine();
-        let (mut b, _tx_b, params_b) = engine();
-        params_a.drum_enabled.set(false);
-        params_b.drum_enabled.set(false);
-        params_a.seq_playing.set(true);
-        params_b.seq_playing.set(true);
+    fn an_enabled_but_empty_rack_leaves_the_output_untouched() {
+        let (mut off, tx_off, params_off) = engine();
+        let (mut on, tx_on, params_on) = engine();
+        for params in [&params_off, &params_on] {
+            params.tempo.set(140.0);
+            params.gen_density.set(1.0);
+        }
+        params_off.drum_enabled.set(false);
+        params_on.drum_enabled.set(true);
+        tx_off.push(Event::ClockStart);
+        tx_on.push(Event::ClockStart);
 
-        assert_eq!(render(&mut a, 4_096), render(&mut b, 4_096));
+        let quiet = render(&mut off, 48_000);
+        assert!(peak(&quiet) > 0.02, "the melody never played");
+        assert_eq!(render(&mut on, 48_000), quiet);
     }
 
     /// And the other half: switched on with a hit programmed, it must actually
