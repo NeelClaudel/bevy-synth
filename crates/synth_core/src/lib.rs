@@ -41,7 +41,7 @@ pub mod sequencer;
 pub mod voice;
 
 pub use clock::{Clock, ClockSource, ClockView};
-pub use drums::{DrumVoice, Pad, PAD_COUNT};
+pub use drums::{Cell, DrumPattern, DrumVoice, Pad, PAD_COUNT};
 pub use engine::{Engine, MAX_VOICES};
 pub use env::{Adsr, AdsrSettings, EnvStage};
 pub use event::{Event, EventQueue};

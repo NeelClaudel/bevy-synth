@@ -5,6 +5,8 @@
 //! out to be a feature: every pad is tunable and stretchable at runtime with
 //! no resampler in sight.
 
+pub mod pattern;
 pub mod voice;
 
+pub use pattern::{pack_column, unpack_column, Cell, Column, DrumPattern};
 pub use voice::{Decay, DrumVoice, Pad, PAD_COUNT};
