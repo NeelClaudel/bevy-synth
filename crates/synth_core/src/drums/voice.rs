@@ -436,6 +436,10 @@ impl DrumVoice {
         !self.is_active()
     }
 
+    pub fn pad(&self) -> Pad {
+        self.pad
+    }
+
     fn is_active(&self) -> bool {
         self.amp.is_active()
             || self.noise_env.is_active()

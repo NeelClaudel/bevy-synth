@@ -229,8 +229,7 @@ mod tests {
     /// The grid has to fire the pads it says it will, on the step it says.
     #[test]
     fn a_hit_on_step_zero_fires_immediately() {
-        let mut p = Params::default();
-        p.drum_enabled = true;
+        let p = Params { drum_enabled: true, ..Default::default() };
         let mut c = running_clock(&p);
         let mut s = DrumSequencer::new();
         s.set_cell(0, 1, Cell { active: true, velocity: 1.0 });
@@ -281,8 +280,7 @@ mod tests {
     /// The grid loops at its own length, not the melody's.
     #[test]
     fn the_grid_wraps_at_its_own_length() {
-        let mut p = Params::default();
-        p.drum_length = 4;
+        let mut p = Params { drum_length: 4, ..Default::default() };
         p.seq_length = 16;
         let mut c = running_clock(&p);
         let mut s = DrumSequencer::new();
@@ -303,8 +301,7 @@ mod tests {
     /// off-beat even though they share a clock.
     #[test]
     fn swing_delays_the_odd_column() {
-        let mut p = Params::default();
-        p.seq_swing = 0.5;
+        let p = Params { seq_swing: 0.5, ..Default::default() };
         let mut c = running_clock(&p);
         let mut s = DrumSequencer::new();
         s.set_cell(1, 0, Cell { active: true, velocity: 1.0 });
@@ -331,8 +328,7 @@ mod tests {
     /// that would fail if either sequencer still owned a clock of its own.
     #[test]
     fn a_sixteen_and_a_twelve_realign_after_forty_eight_steps() {
-        let mut p = Params::default();
-        p.drum_length = 16;
+        let mut p = Params { drum_length: 16, ..Default::default() };
         p.seq_length = 12;
         let mut c = running_clock(&p);
         let mut drums = DrumSequencer::new();
