@@ -14,11 +14,12 @@
 use std::sync::Arc;
 
 use crate::clock::Clock;
+use crate::drums::{Column, DrumPattern, DrumRack};
 use crate::event::{Consumer, Event};
 use crate::fx::FxChain;
 use crate::lfo::Lfo;
 use crate::params::{ClockSource, Params, SharedParams, Smoothed, VoiceMode};
-use crate::sequencer::{GenerativeSettings, Sequencer};
+use crate::sequencer::{GenerativeSettings, Sequencer, MAX_STEPS};
 use crate::voice::Voice;
 use crate::BLOCK;
 
@@ -68,10 +69,15 @@ pub struct Engine {
     /// The effects stage: stereo delay into plate reverb.
     fx: FxChain,
 
+    /// Eight drum pads and their own grid sequencer, running off the same
+    /// clock as the melody.
+    drums: DrumRack,
+
     /// Scratch buffer for one block of voice output.
     block: Vec<f32>,
 
     last_voice_mode: VoiceMode,
+    last_melody_enabled: bool,
     last_regenerate: u32,
     last_pattern_request: u32,
     peak: f32,
@@ -118,8 +124,13 @@ impl Engine {
             // the bottom of the audible range.
             dc_coef: 1.0 - (2.0 * core::f32::consts::PI * 10.0 / sample_rate),
             fx: FxChain::new(sample_rate),
+            // The seed is arbitrary but fixed: the noise pads must sound the
+            // same on every run, or the golden vector would be untestable the
+            // moment drums are switched on.
+            drums: DrumRack::new(sample_rate, 0xD61B_5EED),
             block: vec![0.0; BLOCK],
             last_voice_mode: snapshot.voice_mode,
+            last_melody_enabled: snapshot.melody_enabled,
             last_regenerate: 0,
             last_pattern_request: 0,
             peak: 0.0,
@@ -150,11 +161,17 @@ impl Engine {
         self.master_gain
             .set_time(15.0, sample_rate / BLOCK as f32);
         self.fx.set_sample_rate(sample_rate);
+        self.drums.set_sample_rate(sample_rate);
     }
 
     /// Current sequencer pattern, for display.
     pub fn pattern(&self) -> &[crate::sequencer::Step] {
         self.sequencer.pattern()
+    }
+
+    /// Current drum grid, for display.
+    pub fn drum_grid(&self) -> &DrumPattern {
+        self.drums.sequencer_ref().grid()
     }
 
     /// Fills `out` with mono audio. This is the audio callback's entry point.
@@ -216,6 +233,16 @@ impl Engine {
             self.last_voice_mode = params.voice_mode;
         }
 
+        // Switching the melody off has to release what it is already holding,
+        // or a sequencer note would hang forever with nothing left to send its
+        // note-off. Release rather than kill: this is a mute, not a panic.
+        if params.melody_enabled != self.last_melody_enabled {
+            if !params.melody_enabled {
+                self.all_notes_off(false);
+            }
+            self.last_melody_enabled = params.melody_enabled;
+        }
+
         self.drain_events(&params);
 
         self.lfo.set_rate(params.lfo_rate);
@@ -248,11 +275,20 @@ impl Engine {
                 .set(self.sequencer.pattern().len() as u32);
             self.publish_pattern();
         }
-        if let Some(note) = seq.note_off {
-            self.note_off(note, params);
+        if params.melody_enabled {
+            if let Some(note) = seq.note_off {
+                self.note_off(note, params);
+            }
+            if let Some((note, velocity)) = seq.note_on {
+                self.note_on(note, velocity, params);
+            }
         }
-        if let Some((note, velocity)) = seq.note_on {
-            self.note_on(note, velocity, params);
+
+        // Same `adv`, same `view`: one clock advance drives both sequencers,
+        // so the drums cannot drift from the melody by construction.
+        let drums_playing = self.drums.render(count, adv, view, params);
+        if self.drums.sequencer().take_grid_changed() {
+            self.publish_drum_grid();
         }
 
         let lfo = self.lfo.next_block(params.lfo_wave, count);
@@ -288,11 +324,30 @@ impl Engine {
             right[i] = blocked;
         }
 
+        // Drums into the effects only if asked. They are summed after the
+        // drive stage and the DC blocker either way: a kick through the soft
+        // clipper at drive 3.0 is a different instrument, and not a better one.
+        if drums_playing && params.drum_to_fx {
+            let bus = self.drums.output(count);
+            for i in 0..count {
+                left[i] += bus[i];
+                right[i] += bus[i];
+            }
+        }
+
         // The clock, not `params.tempo`: when an external MIDI clock is
         // driving the sequencer, that is the tempo the delay must lock to.
         let tempo = self.clock.tempo_bpm(params.steps_per_beat);
         self.fx
             .process_block(&mut left[..count], &mut right[..count], params, tempo);
+
+        if drums_playing && !params.drum_to_fx {
+            let bus = self.drums.output(count);
+            for i in 0..count {
+                left[i] += bus[i];
+                right[i] += bus[i];
+            }
+        }
 
         for i in 0..count {
             let l = left[i] * gain;
@@ -378,9 +433,11 @@ impl Engine {
                     if let Some((note, velocity)) = seq.note_on {
                         self.note_on(note, velocity, params);
                     }
+                    self.drums.on_tick(ticked, self.clock.view(), params);
                 }
                 Event::ClockStart => {
                     self.sequencer.rewind();
+                    self.drums.sequencer().rewind();
                     self.clock.start();
                     self.params.seq_playing.set(true);
                 }
@@ -390,6 +447,10 @@ impl Engine {
                     if let Some(note) = self.sequencer.release_all() {
                         self.note_off(note, params);
                     }
+                    // Drums are one-shots with no note-off, so stopping the
+                    // transport has to cut them: there is nothing else that
+                    // ever would.
+                    self.drums.silence();
                 }
                 Event::ClockContinue => {
                     self.clock.resume();
@@ -400,6 +461,14 @@ impl Engine {
                     self.publish_pattern();
                 }
                 Event::Regenerate => self.regenerate(params),
+                Event::SetDrumCell { step, pad, cell } => {
+                    // No publish here: `set_cell` raises the changed flag and
+                    // `render_chunk` publishes once per block, so a burst of
+                    // edits in one block costs one publish, not one each.
+                    self.drums
+                        .sequencer()
+                        .set_cell(step as usize, pad as usize, cell);
+                }
             }
         }
 
@@ -444,6 +513,7 @@ impl Engine {
                 if let Some(note) = self.sequencer.release_all() {
                     self.note_off(note, params);
                 }
+                self.drums.silence();
             }
         }
     }
@@ -464,6 +534,21 @@ impl Engine {
             self.params.publish_step(index, step);
         }
         self.params.publish_len(self.sequencer.pattern().len());
+    }
+
+    /// Copies the drum grid into the shared mirror. Same contract as
+    /// [`Engine::publish_pattern`]: only when it changes, never every block.
+    fn publish_drum_grid(&self) {
+        let grid = self.drums.sequencer_ref().grid();
+        // Every column, not just the active length. Shortening the pattern and
+        // lengthening it again must not show the UI stale cells, and 64 atomic
+        // stores on an edit is the same budget the melodic mirror already
+        // spends.
+        for step in 0..MAX_STEPS {
+            let column: Column = core::array::from_fn(|pad| grid.get(step, pad));
+            self.params.publish_drum_column(step, &column);
+        }
+        self.params.publish_drum_len(grid.len());
     }
 
     // --- Voice allocation ---
@@ -605,6 +690,9 @@ impl Engine {
                 voice.note_off();
             }
         }
+        if hard {
+            self.drums.silence();
+        }
     }
 
     fn remember_held(&mut self, note: u8) {
@@ -640,6 +728,9 @@ impl Engine {
         self.params
             .current_step
             .store(self.sequencer.position() as u32, Relaxed);
+        self.params
+            .drum_position
+            .store(self.drums.sequencer_ref().position() as u32, Relaxed);
 
         // Keep the highest peak the control side has not yet read, so a UI
         // meter polling slower than the audio callback still catches transients.
@@ -669,6 +760,7 @@ pub fn soft_clip(x: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::drums::Cell;
     use crate::event::channel;
     use crate::params::{ClockSource, SharedParams};
 
@@ -687,6 +779,100 @@ mod tests {
 
     fn peak(buffer: &[f32]) -> f32 {
         buffer.iter().fold(0.0f32, |a, &b| a.max(b.abs()))
+    }
+
+    /// The bypass, stated as a test: an engine that has never been told about
+    /// drums must render exactly what it rendered before drums existed.
+    #[test]
+    fn drums_off_leaves_the_output_untouched() {
+        let (mut a, _tx_a, params_a) = engine();
+        let (mut b, _tx_b, params_b) = engine();
+        params_a.drum_enabled.set(false);
+        params_b.drum_enabled.set(false);
+        params_a.seq_playing.set(true);
+        params_b.seq_playing.set(true);
+
+        assert_eq!(render(&mut a, 4_096), render(&mut b, 4_096));
+    }
+
+    /// And the other half: switched on with a hit programmed, it must actually
+    /// reach the output.
+    #[test]
+    fn an_enabled_drum_reaches_the_output() {
+        let (mut engine, tx, params) = engine();
+        params.drum_enabled.set(true);
+        params.seq_playing.set(true);
+        // Silence the melody, so the only thing in the buffer is the drum.
+        params.melody_enabled.set(false);
+        assert!(tx.push(Event::SetDrumCell {
+            step: 0,
+            pad: 0,
+            cell: Cell {
+                active: true,
+                velocity: 1.0
+            },
+        }));
+
+        assert!(
+            peak(&render(&mut engine, 8_192)) > 0.01,
+            "the drum bus never arrived"
+        );
+    }
+
+    /// The routing switch, stated as a test. With `drum_to_fx` off the drum is
+    /// summed *after* the effects, so cranking the reverb to fully wet must not
+    /// touch it — the melody is silent, so the reverb has nothing else to work
+    /// on, and a soaking-wet run has to come out bit-identical to a dry one.
+    /// Flip the switch and the same pattern has to change, or the flag routes
+    /// nothing.
+    #[test]
+    fn a_dry_routed_drum_arrives_unreverberated() {
+        fn kick(to_fx: bool, reverb_mix: f32) -> Vec<f32> {
+            let (mut engine, tx, params) = engine();
+            params.drum_enabled.set(true);
+            params.seq_playing.set(true);
+            params.melody_enabled.set(false);
+            params.drum_to_fx.set(to_fx);
+            params.reverb_mix.set(reverb_mix);
+            assert!(tx.push(Event::SetDrumCell {
+                step: 0,
+                pad: 0,
+                cell: Cell {
+                    active: true,
+                    velocity: 1.0
+                },
+            }));
+            render(&mut engine, 8_192)
+        }
+
+        let dry = kick(false, 0.0);
+        assert!(peak(&dry) > 0.01, "the drum bus never arrived");
+        assert_eq!(
+            kick(false, 1.0),
+            dry,
+            "a bypassed drum picked up reverb anyway"
+        );
+        assert_ne!(kick(true, 1.0), dry, "drum_to_fx routed nothing");
+    }
+
+    /// The mirror is what the UI draws from, so an edit has to show up in it.
+    #[test]
+    fn a_drum_edit_reaches_the_mirror() {
+        let (mut engine, tx, params) = engine();
+        assert!(tx.push(Event::SetDrumCell {
+            step: 5,
+            pad: 3,
+            cell: Cell {
+                active: true,
+                velocity: 0.5
+            },
+        }));
+        render(&mut engine, BLOCK);
+
+        let grid = params.read_drum_grid();
+        assert!(grid.get(5, 3).active);
+        assert_eq!(grid.get(5, 3).velocity, 0.5);
+        assert!(!grid.get(5, 2).active);
     }
 
     /// A pattern longer than the default 16 has to survive being generated,

@@ -16,6 +16,7 @@ use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use crate::drums::Cell;
 use crate::sequencer::Step;
 
 /// Something that happened, to be applied at the next audio block.
@@ -48,6 +49,13 @@ pub enum Event {
     SetStep { index: u8, step: Step },
     /// Throws away the current pattern and generates a new one.
     Regenerate,
+
+    /// Set one cell of the drum grid.
+    ///
+    /// Small enough to travel by value: `Cell` is a `bool` and an `f32`, so
+    /// this variant does not make the enum any larger than `SetStep` already
+    /// does, and every queue slot is sized by the largest variant.
+    SetDrumCell { step: u8, pad: u8, cell: Cell },
 }
 
 /// The shared ring buffer behind a [`Producer`]/[`Consumer`] pair.
