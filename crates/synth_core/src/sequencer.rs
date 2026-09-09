@@ -23,8 +23,8 @@
 //! recognise a figure, and without it even well-chosen notes sound aimless.
 //! Call [`Sequencer::regenerate`] when you want a new one.
 
-use crate::clock::Clock;
-use crate::params::{ClockSource, Params};
+use crate::clock::{Advance, ClockView};
+use crate::params::Params;
 use crate::rng::Rng;
 use crate::scale::ScaleQuantizer;
 
@@ -153,7 +153,6 @@ struct Pending {
 /// The sequencer.
 #[derive(Debug, Clone)]
 pub struct Sequencer {
-    pub clock: Clock,
     pattern: [Step; MAX_STEPS],
     length: usize,
     position: usize,
@@ -175,9 +174,8 @@ pub struct Sequencer {
 }
 
 impl Sequencer {
-    pub fn new(sample_rate: f32, seed: u64) -> Self {
+    pub fn new(seed: u64) -> Self {
         Self {
-            clock: Clock::new(sample_rate),
             pattern: [Step::default(); MAX_STEPS],
             length: 16,
             // Start before step 0 so the first advance lands on it.
@@ -190,10 +188,6 @@ impl Sequencer {
             pattern_changed: false,
             last_length_param: 16,
         }
-    }
-
-    pub fn set_sample_rate(&mut self, sample_rate: f32) {
-        self.clock.set_sample_rate(sample_rate);
     }
 
     /// The step index currently playing.
@@ -338,12 +332,18 @@ impl Sequencer {
     }
 
     /// Advances by a block of samples.
-    pub fn advance(&mut self, samples: usize, p: &Params) -> SeqOutput {
+    ///
+    /// `samples` cannot be inferred from `adv`: the gate and swing countdowns
+    /// are measured in samples, and a block that crosses no step boundary
+    /// still has to tick them down.
+    pub fn advance(
+        &mut self,
+        samples: usize,
+        adv: Advance,
+        clock: ClockView,
+        p: &Params,
+    ) -> SeqOutput {
         let mut out = SeqOutput::default();
-
-        if p.clock_source == ClockSource::Internal {
-            self.clock.set_tempo(p.tempo, p.steps_per_beat);
-        }
 
         // Only when the knob actually moves. Comparing against our own length
         // instead would fight a loaded pattern, whose length comes from the
@@ -364,7 +364,7 @@ impl Sequencer {
         // Stopped, there is no bar line to wait for. Checked here rather than
         // in `queue_pattern` so that both orderings land: loaded while stopped,
         // and loaded while playing and then stopped before the wrap came.
-        if !self.clock.is_running() {
+        if !clock.running {
             if let Some(pattern) = self.queued.take() {
                 self.apply_pattern(&pattern);
             }
@@ -386,32 +386,31 @@ impl Sequencer {
             pending.samples_remaining -= samples_f;
             if pending.samples_remaining <= 0.0 {
                 let pending = self.pending.take().expect("just checked");
-                self.trigger(pending.note, pending.velocity, p, &mut out);
+                self.trigger(pending.note, pending.velocity, p, clock, &mut out);
             }
         }
 
-        let advance = self.clock.advance(samples, p.clock_source);
-        for _ in 0..advance.steps {
-            self.step(p, &mut out);
+        for _ in 0..adv.steps {
+            self.step(p, clock, &mut out);
         }
 
         out
     }
 
     /// Called by the engine when an external MIDI clock tick arrives.
-    pub fn on_midi_tick(&mut self, p: &Params) -> SeqOutput {
+    ///
+    /// Whether the tick lands on a step is the engine's decision — it owns the
+    /// clock and the clock source — so the answer arrives as an argument.
+    pub fn on_midi_tick(&mut self, ticked: bool, clock: ClockView, p: &Params) -> SeqOutput {
         let mut out = SeqOutput::default();
-        if p.clock_source == ClockSource::ExternalMidi
-            && self.clock.is_running()
-            && self.clock.on_midi_tick(p.steps_per_beat)
-        {
-            self.step(p, &mut out);
+        if ticked {
+            self.step(p, clock, &mut out);
         }
         out
     }
 
     /// Moves to the next step and triggers whatever is there.
-    fn step(&mut self, p: &Params, out: &mut SeqOutput) {
+    fn step(&mut self, p: &Params, clock: ClockView, out: &mut SeqOutput) {
         let next = if self.position == usize::MAX {
             0
         } else {
@@ -437,7 +436,7 @@ impl Sequencer {
         // metronome, and a little goes a long way — 0.1 to 0.2 is most of the
         // useful range.
         let swing_delay = if self.position % 2 == 1 && p.seq_swing > 0.0 {
-            p.seq_swing * self.clock.samples_per_step()
+            p.seq_swing * clock.samples_per_step
         } else {
             0.0
         };
@@ -449,11 +448,18 @@ impl Sequencer {
                 samples_remaining: swing_delay,
             });
         } else {
-            self.trigger(step.note, step.velocity, p, out);
+            self.trigger(step.note, step.velocity, p, clock, out);
         }
     }
 
-    fn trigger(&mut self, note: u8, velocity: f32, p: &Params, out: &mut SeqOutput) {
+    fn trigger(
+        &mut self,
+        note: u8,
+        velocity: f32,
+        p: &Params,
+        clock: ClockView,
+        out: &mut SeqOutput,
+    ) {
         // Release whatever is sounding first, so the voice allocator sees a
         // clean note-off before the note-on. Without this, a gate above 1.0
         // would leak voices.
@@ -463,7 +469,7 @@ impl Sequencer {
 
         out.note_on = Some((note, velocity));
         self.sounding = Some(note);
-        self.samples_until_off = p.seq_gate * self.clock.samples_per_step();
+        self.samples_until_off = p.seq_gate * clock.samples_per_step;
     }
 
     /// Releases anything the sequencer is holding. Call when the transport
@@ -477,8 +483,22 @@ impl Sequencer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::{Clock, ClockSource};
     use crate::scale::Scale;
     use crate::BLOCK;
+
+    /// Drives a sequencer for one block from a clock the test owns.
+    ///
+    /// The engine does this for real; the tests need the same wiring in one
+    /// line, so that hoisting the clock does not turn into a rewrite of every
+    /// test.
+    fn block(s: &mut Sequencer, c: &mut Clock, p: &Params) -> SeqOutput {
+        if p.clock_source == ClockSource::Internal {
+            c.set_tempo(p.tempo, p.steps_per_beat);
+        }
+        let adv = c.advance(BLOCK, p.clock_source);
+        s.advance(BLOCK, adv, c.view(), p)
+    }
 
     fn settings() -> GenerativeSettings {
         GenerativeSettings {
@@ -497,7 +517,7 @@ mod tests {
     fn every_generated_note_is_in_key() {
         for scale in Scale::ALL {
             for root in 0..12u8 {
-                let mut s = Sequencer::new(48000.0, 1234);
+                let mut s = Sequencer::new(1234);
                 let mut gen = settings();
                 gen.scale = scale;
                 gen.root = root;
@@ -519,7 +539,7 @@ mod tests {
 
     #[test]
     fn generated_notes_stay_in_the_requested_range() {
-        let mut s = Sequencer::new(48000.0, 99);
+        let mut s = Sequencer::new(99);
         let mut gen = settings();
         gen.octave = 4;
         gen.range = 2;
@@ -543,13 +563,13 @@ mod tests {
     #[test]
     fn the_same_seed_gives_the_same_melody() {
         let gen = settings();
-        let mut a = Sequencer::new(48000.0, 777);
-        let mut b = Sequencer::new(48000.0, 777);
+        let mut a = Sequencer::new(777);
+        let mut b = Sequencer::new(777);
         a.regenerate(&gen);
         b.regenerate(&gen);
         assert_eq!(a.pattern(), b.pattern());
 
-        let mut c = Sequencer::new(48000.0, 778);
+        let mut c = Sequencer::new(778);
         c.regenerate(&gen);
         assert_ne!(a.pattern(), c.pattern(), "different seeds should differ");
     }
@@ -557,7 +577,7 @@ mod tests {
     #[test]
     fn density_controls_how_many_steps_sound() {
         let count_at = |density: f32| {
-            let mut s = Sequencer::new(48000.0, 5);
+            let mut s = Sequencer::new(5);
             let mut gen = settings();
             gen.density = density;
             gen.length = 64;
@@ -572,7 +592,7 @@ mod tests {
     #[test]
     fn the_first_step_always_sounds() {
         for seed in 0..50u64 {
-            let mut s = Sequencer::new(48000.0, seed);
+            let mut s = Sequencer::new(seed);
             let mut gen = settings();
             gen.density = 0.05;
             s.regenerate(&gen);
@@ -584,7 +604,7 @@ mod tests {
     /// scattering. Average interval well under an octave is the check.
     #[test]
     fn the_melody_walks_rather_than_leaping() {
-        let mut s = Sequencer::new(48000.0, 31337);
+        let mut s = Sequencer::new(31337);
         let mut gen = settings();
         gen.length = 64;
         gen.density = 1.0;
@@ -601,7 +621,7 @@ mod tests {
 
     #[test]
     fn downbeats_favour_chord_tones() {
-        let mut s = Sequencer::new(48000.0, 4242);
+        let mut s = Sequencer::new(4242);
         let mut gen = settings();
         gen.scale = Scale::Major;
         gen.length = 64;
@@ -638,7 +658,7 @@ mod tests {
 
     #[test]
     fn playing_produces_matched_note_ons_and_offs() {
-        let mut s = Sequencer::new(48000.0, 8);
+        let mut s = Sequencer::new(8);
         let gen = settings();
         s.regenerate(&gen);
 
@@ -646,13 +666,14 @@ mod tests {
         p.tempo = 120.0;
         p.steps_per_beat = 4.0;
         p.seq_gate = 0.5;
-        s.clock.start();
+        let mut c = Clock::new(48000.0);
+        c.start();
 
         let mut ons = 0;
         let mut offs = 0;
         // Four seconds of audio.
         for _ in 0..(48000 * 4 / BLOCK) {
-            let out = s.advance(BLOCK, &p);
+            let out = block(&mut s, &mut c, &p);
             if out.note_on.is_some() {
                 ons += 1;
             }
@@ -671,18 +692,19 @@ mod tests {
 
     #[test]
     fn a_stopped_sequencer_is_silent() {
-        let mut s = Sequencer::new(48000.0, 8);
+        let mut s = Sequencer::new(8);
         s.regenerate(&settings());
         let p = Params::default();
+        let mut c = Clock::new(48000.0);
         // Never started the clock.
         for _ in 0..10_000 {
-            assert_eq!(s.advance(BLOCK, &p), SeqOutput::default());
+            assert_eq!(block(&mut s, &mut c, &p), SeqOutput::default());
         }
     }
 
     #[test]
     fn swing_delays_the_offbeats() {
-        let mut s = Sequencer::new(48000.0, 3);
+        let mut s = Sequencer::new(3);
         let mut gen = settings();
         gen.density = 1.0;
         s.regenerate(&gen);
@@ -691,12 +713,13 @@ mod tests {
         p.tempo = 120.0;
         p.steps_per_beat = 4.0;
         p.seq_swing = 0.3;
-        s.clock.start();
+        let mut c = Clock::new(48000.0);
+        c.start();
 
         let mut on_times = Vec::new();
-        for block in 0..(48000 * 2 / BLOCK) {
-            if s.advance(BLOCK, &p).note_on.is_some() {
-                on_times.push(block * BLOCK);
+        for blk in 0..(48000 * 2 / BLOCK) {
+            if block(&mut s, &mut c, &p).note_on.is_some() {
+                on_times.push(blk * BLOCK);
             }
         }
 
@@ -729,12 +752,18 @@ mod tests {
 
     /// Runs the sequencer until `stop` says so, giving up rather than hanging
     /// if the condition never comes true.
-    fn run_until(s: &mut Sequencer, p: &Params, what: &str, stop: impl Fn(&Sequencer) -> bool) {
+    fn run_until(
+        s: &mut Sequencer,
+        c: &mut Clock,
+        p: &Params,
+        what: &str,
+        stop: impl Fn(&Sequencer) -> bool,
+    ) {
         for _ in 0..100_000 {
             if stop(s) {
                 return;
             }
-            s.advance(BLOCK, p);
+            block(s, c, p);
         }
         panic!("gave up waiting for {what}");
     }
@@ -744,24 +773,25 @@ mod tests {
     /// is expecting a change anyway.
     #[test]
     fn a_queued_pattern_waits_for_the_bar_line() {
-        let mut s = Sequencer::new(48000.0, 8);
+        let mut s = Sequencer::new(8);
         s.regenerate(&settings());
         let before = s.pattern().to_vec();
 
         let mut p = Params::default();
         p.tempo = 120.0;
         p.steps_per_beat = 4.0;
-        s.clock.start();
+        let mut c = Clock::new(48000.0);
+        c.start();
 
         // Get off step zero first, so the wrap we are waiting for is a real one.
-        run_until(&mut s, &p, "the first step", |s| s.position() == 1);
+        run_until(&mut s, &mut c, &p, "the first step", |s| s.position() == 1);
 
         s.queue_pattern(marker_pattern(12, 16));
-        s.advance(BLOCK, &p);
+        block(&mut s, &mut c, &p);
         assert_eq!(s.pattern(), before.as_slice(), "swapped mid-loop");
         assert!(!s.take_pattern_changed());
 
-        run_until(&mut s, &p, "the bar line", |s| s.position() == 0);
+        run_until(&mut s, &mut c, &p, "the bar line", |s| s.position() == 0);
         assert!(
             s.pattern().iter().all(|step| step.note == 12),
             "did not swap at the bar line"
@@ -774,12 +804,13 @@ mod tests {
     /// pattern lands at once — including one queued a moment before the stop.
     #[test]
     fn a_queued_pattern_lands_at_once_when_stopped() {
-        let mut s = Sequencer::new(48000.0, 8);
+        let mut s = Sequencer::new(8);
         s.regenerate(&settings());
         let p = Params::default();
+        let mut c = Clock::new(48000.0);
 
         s.queue_pattern(marker_pattern(12, 8));
-        s.advance(BLOCK, &p);
+        block(&mut s, &mut c, &p);
 
         assert_eq!(s.pattern().len(), 8, "the pattern brought its own length");
         assert!(s.pattern().iter().all(|step| step.note == 12));
@@ -790,19 +821,20 @@ mod tests {
     /// should ever be heard.
     #[test]
     fn the_last_queued_pattern_wins() {
-        let mut s = Sequencer::new(48000.0, 8);
+        let mut s = Sequencer::new(8);
         s.regenerate(&settings());
 
         let mut p = Params::default();
         p.tempo = 120.0;
         p.steps_per_beat = 4.0;
-        s.clock.start();
-        run_until(&mut s, &p, "the first step", |s| s.position() == 1);
+        let mut c = Clock::new(48000.0);
+        c.start();
+        run_until(&mut s, &mut c, &p, "the first step", |s| s.position() == 1);
 
         s.queue_pattern(marker_pattern(12, 16));
         s.queue_pattern(marker_pattern(24, 16));
 
-        run_until(&mut s, &p, "the bar line", |s| s.position() == 0);
+        run_until(&mut s, &mut c, &p, "the bar line", |s| s.position() == 0);
         assert!(s.pattern().iter().all(|step| step.note == 24));
     }
 }

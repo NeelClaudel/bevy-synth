@@ -13,10 +13,11 @@
 
 use std::sync::Arc;
 
+use crate::clock::Clock;
 use crate::event::{Consumer, Event};
 use crate::fx::FxChain;
 use crate::lfo::Lfo;
-use crate::params::{Params, SharedParams, Smoothed, VoiceMode};
+use crate::params::{ClockSource, Params, SharedParams, Smoothed, VoiceMode};
 use crate::sequencer::{GenerativeSettings, Sequencer};
 use crate::voice::Voice;
 use crate::BLOCK;
@@ -45,6 +46,10 @@ pub struct Engine {
     voices: Vec<Voice>,
     lfo: Lfo,
     sequencer: Sequencer,
+    /// The one clock. Both sequencers read the same advance from it, which is
+    /// what makes "in sync" a property of the structure rather than of two
+    /// accumulators that happen to agree today.
+    clock: Clock,
 
     /// Increments on every note-on; the lowest value is the oldest voice.
     age_counter: u64,
@@ -91,7 +96,9 @@ impl Engine {
         let control_rate = sample_rate / BLOCK as f32;
         let snapshot = params.snapshot();
 
-        let mut sequencer = Sequencer::new(sample_rate, params.gen_seed.load(core::sync::atomic::Ordering::Relaxed));
+        let mut sequencer = Sequencer::new(
+            params.gen_seed.load(core::sync::atomic::Ordering::Relaxed),
+        );
         sequencer.regenerate(&GenerativeSettings::from_params(&snapshot));
 
         let mut engine = Self {
@@ -101,6 +108,7 @@ impl Engine {
             voices,
             lfo: Lfo::new(sample_rate, 0xA5A5),
             sequencer,
+            clock: Clock::new(sample_rate),
             age_counter: 1,
             held: Vec::with_capacity(MAX_HELD),
             master_gain: Smoothed::new(snapshot.master_gain, 15.0, control_rate),
@@ -116,7 +124,7 @@ impl Engine {
             last_pattern_request: 0,
             peak: 0.0,
         };
-        engine.sequencer.clock.set_tempo(snapshot.tempo, snapshot.steps_per_beat);
+        engine.clock.set_tempo(snapshot.tempo, snapshot.steps_per_beat);
         engine.publish_pattern();
         engine
     }
@@ -137,7 +145,7 @@ impl Engine {
             voice.set_sample_rate(sample_rate);
         }
         self.lfo.set_sample_rate(sample_rate);
-        self.sequencer.set_sample_rate(sample_rate);
+        self.clock.set_sample_rate(sample_rate);
         self.dc_coef = 1.0 - (2.0 * core::f32::consts::PI * 10.0 / sample_rate);
         self.master_gain
             .set_time(15.0, sample_rate / BLOCK as f32);
@@ -222,7 +230,16 @@ impl Engine {
     fn render_chunk(&mut self, left: &mut [f32], right: &mut [f32], params: &Params) {
         let count = left.len().min(right.len());
 
-        let seq = self.sequencer.advance(count, params);
+        // Tempo, then one advance, then everything that steps reads the same
+        // result. `set_tempo` came here from the sequencer along with the
+        // clock; under an external MIDI clock the ticks set the rate instead.
+        if params.clock_source == ClockSource::Internal {
+            self.clock.set_tempo(params.tempo, params.steps_per_beat);
+        }
+        let adv = self.clock.advance(count, params.clock_source);
+        let view = self.clock.view();
+
+        let seq = self.sequencer.advance(count, adv, view, params);
         if self.sequencer.take_pattern_changed() {
             // The pattern brought its own length, so the knob has to follow it
             // or the next block's reconcile would cut the melody short.
@@ -273,7 +290,7 @@ impl Engine {
 
         // The clock, not `params.tempo`: when an external MIDI clock is
         // driving the sequencer, that is the tempo the delay must lock to.
-        let tempo = self.sequencer.clock.tempo_bpm(params.steps_per_beat);
+        let tempo = self.clock.tempo_bpm(params.steps_per_beat);
         self.fx
             .process_block(&mut left[..count], &mut right[..count], params, tempo);
 
@@ -349,7 +366,12 @@ impl Engine {
                 Event::PitchBend(semitones) => self.params.pitch_bend.set(semitones),
                 Event::ModWheel(value) => self.params.mod_wheel.set(value),
                 Event::ClockTick => {
-                    let seq = self.sequencer.on_midi_tick(params);
+                    // The engine owns the clock, so it also owns the decision
+                    // about whether this tick advances anything.
+                    let ticked = params.clock_source == ClockSource::ExternalMidi
+                        && self.clock.is_running()
+                        && self.clock.on_midi_tick(params.steps_per_beat);
+                    let seq = self.sequencer.on_midi_tick(ticked, self.clock.view(), params);
                     if let Some(note) = seq.note_off {
                         self.note_off(note, params);
                     }
@@ -359,18 +381,18 @@ impl Engine {
                 }
                 Event::ClockStart => {
                     self.sequencer.rewind();
-                    self.sequencer.clock.start();
+                    self.clock.start();
                     self.params.seq_playing.set(true);
                 }
                 Event::ClockStop => {
-                    self.sequencer.clock.stop();
+                    self.clock.stop();
                     self.params.seq_playing.set(false);
                     if let Some(note) = self.sequencer.release_all() {
                         self.note_off(note, params);
                     }
                 }
                 Event::ClockContinue => {
-                    self.sequencer.clock.resume();
+                    self.clock.resume();
                     self.params.seq_playing.set(true);
                 }
                 Event::SetStep { index, step } => {
@@ -414,11 +436,11 @@ impl Engine {
         // the pre-event snapshot would see "running, but the flag says stopped"
         // and immediately undo the start.
         let should_play = self.params.seq_playing.get();
-        if should_play != self.sequencer.clock.is_running() {
+        if should_play != self.clock.is_running() {
             if should_play {
-                self.sequencer.clock.start();
+                self.clock.start();
             } else {
-                self.sequencer.clock.stop();
+                self.clock.stop();
                 if let Some(note) = self.sequencer.release_all() {
                     self.note_off(note, params);
                 }

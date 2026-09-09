@@ -57,6 +57,20 @@ pub struct Advance {
     pub steps: u32,
 }
 
+/// What a sequencer needs to know about the clock for one block.
+///
+/// Handed out by value so that every sequencer in a block reads the same
+/// numbers from the same advance. Eight bytes and `Copy`: cheaper to pass than
+/// to borrow, and impossible to hold across a block boundary by accident.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClockView {
+    /// Samples in one step at the current tempo. Scales gate length and swing,
+    /// both of which are measured against the step rather than the beat.
+    pub samples_per_step: f32,
+    /// Whether the transport is rolling.
+    pub running: bool,
+}
+
 impl Clock {
     pub fn new(sample_rate: f32) -> Self {
         Self {
@@ -110,6 +124,14 @@ impl Clock {
     #[inline]
     pub fn samples_per_step(&self) -> f32 {
         self.samples_per_step as f32
+    }
+
+    /// Snapshots the parts of the clock a sequencer reads.
+    pub fn view(&self) -> ClockView {
+        ClockView {
+            samples_per_step: self.samples_per_step(),
+            running: self.is_running(),
+        }
     }
 
     /// Best estimate of the current tempo in BPM. With an external clock this
@@ -343,5 +365,23 @@ mod tests {
 
         c.start();
         assert_eq!(c.phase(), 0.0, "start must rewind");
+    }
+
+    /// The view is what every sequencer in a block reads instead of the clock
+    /// itself, so it has to agree with the clock it came from.
+    #[test]
+    fn a_view_reports_what_the_sequencers_read() {
+        let mut c = Clock::new(48_000.0);
+        c.set_tempo(120.0, 4.0);
+
+        let stopped = c.view();
+        assert!(!stopped.running);
+        assert!(
+            (stopped.samples_per_step - c.samples_per_step()).abs() < 1e-6,
+            "view disagrees with the clock it came from"
+        );
+
+        c.start();
+        assert!(c.view().running);
     }
 }

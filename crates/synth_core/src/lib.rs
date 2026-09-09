@@ -39,7 +39,7 @@ pub mod scale;
 pub mod sequencer;
 pub mod voice;
 
-pub use clock::{Clock, ClockSource};
+pub use clock::{Clock, ClockSource, ClockView};
 pub use engine::{Engine, MAX_VOICES};
 pub use env::{Adsr, AdsrSettings, EnvStage};
 pub use event::{Event, EventQueue};
