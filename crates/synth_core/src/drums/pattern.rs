@@ -102,15 +102,6 @@ impl DrumPattern {
         self.len = len.min(MAX_STEPS);
     }
 
-    /// True when any cell inside the active length fires. The engine bypasses
-    /// the entire drum bus when this is false, which is what keeps the golden
-    /// vector byte-identical for patches that never touch the drums.
-    pub fn has_hits(&self) -> bool {
-        self.columns[..self.len]
-            .iter()
-            .any(|column| column.iter().any(|cell| cell.active))
-    }
-
     /// Out-of-range indices return an inactive cell rather than panicking:
     /// some callers are on the audio thread, where a wrong cell is survivable
     /// and a panic is not.
@@ -158,6 +149,12 @@ impl Default for DrumPattern {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Does anything inside the active length fire? Only the tests ask, so it
+    /// lives here rather than on the pattern.
+    fn any_active(grid: &DrumPattern) -> bool {
+        (0..grid.len()).any(|step| (0..PAD_COUNT).any(|pad| grid.get(step, pad).active))
+    }
 
     /// The whole point of the packing: a column survives the round trip
     /// through a single `u32`, which is what crosses the thread boundary.
@@ -226,20 +223,20 @@ mod tests {
         }
     }
 
-    /// The engine bypasses the whole drum bus on an empty grid, so "empty"
-    /// has to mean what it says.
+    /// An untouched grid fires nothing, and a toggle is its own inverse.
     #[test]
-    fn an_untouched_grid_has_no_hits() {
+    fn toggling_a_cell_turns_it_on_and_off_again() {
         let mut grid = DrumPattern::default();
         grid.set_len(16);
-        assert!(!grid.has_hits());
+        assert!(!any_active(&grid));
 
         grid.toggle(0, 0);
-        assert!(grid.has_hits());
         assert!(grid.get(0, 0).active);
+        assert!(any_active(&grid));
 
         grid.toggle(0, 0);
-        assert!(!grid.has_hits());
+        assert!(!grid.get(0, 0).active);
+        assert!(!any_active(&grid));
     }
 
     /// Out-of-range indices come from the UI and from packed data. They must
@@ -250,7 +247,7 @@ mod tests {
         grid.set(999, 0, Cell { active: true, velocity: 1.0 });
         grid.set(0, 99, Cell { active: true, velocity: 1.0 });
         grid.toggle(999, 99);
-        assert!(!grid.has_hits());
+        assert!(!any_active(&grid));
         assert!(!grid.get(999, 99).active);
         assert_eq!(DrumPattern::default().len(), 0);
     }

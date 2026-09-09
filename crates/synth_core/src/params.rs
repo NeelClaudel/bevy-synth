@@ -1385,6 +1385,5 @@ mod tests {
         assert!(grid.get(3, 1).active);
         assert!(!grid.get(3, 0).active);
         assert!(!grid.get(4, 1).active);
-        assert!(grid.has_hits());
     }
 }
