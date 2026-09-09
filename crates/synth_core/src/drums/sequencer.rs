@@ -400,6 +400,59 @@ mod tests {
         assert!(steps > 0, "no MIDI tick ever produced a step");
     }
 
+    /// Swing is written twice — once here, once in the melodic sequencer — and
+    /// the two are deliberately not shared. Nothing stopped them drifting
+    /// apart, so this pins the agreement: one clock, one swing setting, a hit
+    /// on every step of both tracks, and the same blocks have to fire.
+    #[test]
+    fn both_tracks_swing_the_same_steps_by_the_same_amount() {
+        let p = Params { seq_swing: 0.3, ..Default::default() };
+        let mut c = running_clock(&p);
+        let mut drums = DrumSequencer::new();
+        let mut melody = crate::sequencer::Sequencer::new(1);
+        for step in 0..16 {
+            drums.set_cell(step, 0, Cell { active: true, velocity: 1.0 });
+            melody.set_step(
+                step,
+                crate::sequencer::Step { active: true, ..Default::default() },
+            );
+        }
+
+        let mut stepped_on = Vec::new();
+        let mut drums_fired_on = Vec::new();
+        let mut melody_fired_on = Vec::new();
+        for i in 0..4_000 {
+            let adv = c.advance(BLOCK, ClockSource::Internal);
+            let d = drums.advance(BLOCK, adv, c.view(), &p);
+            let m = melody.advance(BLOCK, adv, c.view(), &p);
+            if d.stepped {
+                stepped_on.push(i);
+            }
+            if d.hits.iter().any(|&level| level > 0.0) {
+                drums_fired_on.push(i);
+            }
+            if m.note_on.is_some() {
+                melody_fired_on.push(i);
+            }
+        }
+        assert_eq!(drums_fired_on, melody_fired_on, "the two tracks swung apart");
+
+        // And the agreement is not the trivial one of neither swinging: the
+        // delay a step took, in blocks, has to be zero on the beat and
+        // non-zero off it, which is what swing means.
+        assert_eq!(drums_fired_on.len(), stepped_on.len(), "a step never fired");
+        let delays: Vec<usize> = drums_fired_on
+            .iter()
+            .zip(&stepped_on)
+            .map(|(fired, stepped)| fired - stepped)
+            .collect();
+        assert!(delays.iter().step_by(2).all(|&d| d == 0), "on-beats swung: {delays:?}");
+        assert!(
+            delays.iter().skip(1).step_by(2).all(|&d| d > 0),
+            "off-beats did not swing: {delays:?}"
+        );
+    }
+
     /// A first-ever tick, before any block has rendered. `DrumPattern::default`
     /// starts at length zero and only `advance` reconciled the length knob, so
     /// under an external clock the very first `ClockTick` — `ClockStart` then
