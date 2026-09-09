@@ -1,5 +1,6 @@
 //! Eight synthesized percussion voices sharing one one-shot envelope shape.
 
+use crate::filter::{Svf, SvfMode};
 use crate::note::cents_to_ratio;
 use crate::rng::Rng;
 
@@ -79,6 +80,145 @@ impl Pad {
             Pad::Rim => 0.028,
         }
     }
+
+    /// Pads that cannot ring together. Closing a hi-hat stops the open one:
+    /// this is what makes a hat part sound like one instrument rather than two
+    /// overlapping ones. Nothing else on the kit chokes.
+    pub fn choke_group(self) -> Option<u8> {
+        match self {
+            Pad::ClosedHat | Pad::OpenHat => Some(0),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wave {
+    Sine,
+    Triangle,
+}
+
+/// Everything that distinguishes one pad from another, as numbers. Keeping the
+/// differences in data rather than in branches means `DrumVoice::next` is one
+/// algorithm, and adding a pad is adding a row.
+#[derive(Debug, Clone, Copy)]
+struct Recipe {
+    wave: Wave,
+    /// Level of the body oscillator, 0.0 for the noise-only pads.
+    body: f32,
+    /// Second oscillator, as a ratio of the first. `partial` is its level.
+    partial_ratio: f32,
+    partial: f32,
+    /// Pitch envelope depth: the body starts `1 + bend` times up.
+    bend: f32,
+    bend_time: f32,
+    /// Level of the filtered noise, 0.0 for the pitched pads.
+    noise: f32,
+    /// Noise filter centre, as a ratio of the pad's tuned base frequency.
+    noise_ratio: f32,
+    noise_res: f32,
+    noise_mode: SvfMode,
+    /// Noise decay as a multiple of the pad's decay: a snare's rattle outlasts
+    /// its body.
+    noise_decay: f32,
+    /// Level of the unfiltered 2 ms transient.
+    click: f32,
+    /// Envelope retriggers. 1 for everything but the clap.
+    bursts: u8,
+    burst_gap: f32,
+}
+
+const NO_RECIPE: Recipe = Recipe {
+    wave: Wave::Sine,
+    body: 0.0,
+    partial_ratio: 1.0,
+    partial: 0.0,
+    bend: 0.0,
+    bend_time: 0.01,
+    noise: 0.0,
+    noise_ratio: 1.0,
+    noise_res: 0.2,
+    noise_mode: SvfMode::Bandpass,
+    noise_decay: 1.0,
+    click: 0.0,
+    bursts: 1,
+    burst_gap: 0.010,
+};
+
+impl Pad {
+    fn recipe(self) -> Recipe {
+        match self {
+            // A sine falling from four times its pitch, with a click on top.
+            Pad::Kick => Recipe {
+                body: 1.0,
+                bend: 3.0,
+                bend_time: 0.05,
+                click: 0.5,
+                ..NO_RECIPE
+            },
+            // Two detuned triangles for the body, noise through a bandpass an
+            // octave and a bit above, ringing longer than the body.
+            Pad::Snare => Recipe {
+                wave: Wave::Triangle,
+                body: 0.45,
+                partial_ratio: 1.62,
+                partial: 0.3,
+                bend: 0.6,
+                bend_time: 0.02,
+                noise: 0.8,
+                noise_ratio: 10.0,
+                noise_res: 0.25,
+                noise_decay: 1.3,
+                ..NO_RECIPE
+            },
+            Pad::ClosedHat => Recipe {
+                noise: 1.0,
+                noise_mode: SvfMode::Highpass,
+                noise_res: 0.1,
+                ..NO_RECIPE
+            },
+            // Identical but for the decay, which lives in `base_decay`.
+            Pad::OpenHat => Recipe {
+                noise: 1.0,
+                noise_mode: SvfMode::Highpass,
+                noise_res: 0.1,
+                ..NO_RECIPE
+            },
+            Pad::Clap => Recipe {
+                noise: 1.0,
+                noise_res: 0.35,
+                bursts: 3,
+                burst_gap: 0.010,
+                ..NO_RECIPE
+            },
+            Pad::LowTom => Recipe {
+                body: 1.0,
+                bend: 1.2,
+                bend_time: 0.08,
+                noise: 0.05,
+                noise_ratio: 8.0,
+                noise_mode: SvfMode::Highpass,
+                noise_decay: 0.2,
+                ..NO_RECIPE
+            },
+            Pad::HighTom => Recipe {
+                body: 1.0,
+                bend: 1.4,
+                bend_time: 0.06,
+                noise: 0.05,
+                noise_ratio: 8.0,
+                noise_mode: SvfMode::Highpass,
+                noise_decay: 0.2,
+                ..NO_RECIPE
+            },
+            // One short bandpassed burst and nothing else.
+            Pad::Rim => Recipe {
+                noise: 1.0,
+                noise_res: 0.5,
+                ..NO_RECIPE
+            },
+        }
+    }
 }
 
 /// A one-shot exponential fall. `Adsr` waits for a note-off; a drum has none,
@@ -143,37 +283,56 @@ impl Default for Decay {
 pub struct DrumVoice {
     sample_rate: f32,
     pad: Pad,
+    recipe: Recipe,
     rng: Rng,
 
-    /// Body oscillator: phase in turns, so wrapping is a subtraction.
+    /// Body oscillators: phase in turns, so wrapping is a subtraction.
     phase: f32,
+    partial_phase: f32,
     hz: f32,
 
-    /// Amplitude of the body tone.
     amp: Decay,
-    /// Pitch envelope: multiplies `hz` on its way to the oscillator, giving
-    /// the kick its downward thump.
+    /// Multiplies `hz` on its way to the oscillator: the downward thump.
     pitch: Decay,
-    /// The short noise transient at the head of the hit.
+    noise_env: Decay,
+    /// The short unfiltered transient at the head of the hit.
     click: Decay,
+    filter: Svf,
+
+    /// Clap retriggering. `bursts_left` counts envelope restarts still owed.
+    bursts_left: u8,
+    burst_countdown: u32,
+    /// Held so a retrigger can reuse the strike's level and length.
+    gain: f32,
+    decay_secs: f32,
 }
 
 impl DrumVoice {
     pub fn new(sample_rate: f32, seed: u64) -> DrumVoice {
+        let sample_rate = sample_rate.max(1.0);
         DrumVoice {
-            sample_rate: sample_rate.max(1.0),
+            sample_rate,
             pad: Pad::Kick,
+            recipe: Pad::Kick.recipe(),
             rng: Rng::new(seed),
             phase: 0.0,
+            partial_phase: 0.0,
             hz: Pad::Kick.base_hz(),
             amp: Decay::new(),
             pitch: Decay::new(),
+            noise_env: Decay::new(),
             click: Decay::new(),
+            filter: Svf::new(sample_rate),
+            bursts_left: 0,
+            burst_countdown: 0,
+            gain: 0.0,
+            decay_secs: 0.0,
         }
     }
 
     pub fn set_sample_rate(&mut self, sample_rate: f32) {
         self.sample_rate = sample_rate.max(1.0);
+        self.filter.set_sample_rate(self.sample_rate);
         self.silence();
     }
 
@@ -181,15 +340,45 @@ impl DrumVoice {
     /// pitch, and `decay_scale` stretches or shortens the tail.
     pub fn strike(&mut self, pad: Pad, gain: f32, tune_semitones: f32, decay_scale: f32) {
         self.pad = pad;
+        self.recipe = pad.recipe();
         self.hz = pad.base_hz() * cents_to_ratio(tune_semitones * 100.0);
         self.phase = 0.0;
+        self.partial_phase = 0.0;
+        self.gain = gain;
+        self.decay_secs = pad.base_decay() * decay_scale.clamp(0.1, 4.0);
 
-        let decay = pad.base_decay() * decay_scale.clamp(0.1, 4.0);
-        self.amp.trigger(decay, self.sample_rate, gain);
-        // 50 ms of pitch bend: the drop is what makes it read as a kick
-        // rather than a bass note.
-        self.pitch.trigger(0.05, self.sample_rate, 1.0);
-        self.click.trigger(0.002, self.sample_rate, gain * 0.5);
+        self.filter.set_params(
+            self.hz * self.recipe.noise_ratio,
+            self.recipe.noise_res,
+        );
+
+        self.amp.trigger(self.decay_secs, self.sample_rate, gain);
+        self.pitch.trigger(self.recipe.bend_time, self.sample_rate, 1.0);
+        self.click
+            .trigger(0.002, self.sample_rate, gain * self.recipe.click);
+
+        if self.recipe.bursts > 1 {
+            // The clap's envelope is driven by the burst counter, starting on
+            // the next sample rather than here.
+            self.noise_env.silence();
+            self.bursts_left = self.recipe.bursts;
+            self.burst_countdown = 0;
+        } else {
+            self.bursts_left = 0;
+            // A pad with no noise component (the kick) must not leave the
+            // envelope sitting at a nonzero level forever: `next` never reads
+            // it, so `is_active` would never see it fall and the voice would
+            // never report itself silent.
+            if self.recipe.noise > 0.0 {
+                self.noise_env.trigger(
+                    self.decay_secs * self.recipe.noise_decay,
+                    self.sample_rate,
+                    gain,
+                );
+            } else {
+                self.noise_env.silence();
+            }
+        }
     }
 
     // Not `Iterator::next`, for the same reason as `Adsr::next`: this is a
@@ -199,18 +388,48 @@ impl DrumVoice {
         if !self.is_active() {
             return 0.0;
         }
+        self.advance_bursts();
 
-        // The pitch envelope runs 1 -> 0, and the body starts four times up.
-        let bend = 1.0 + self.pitch.next() * 3.0;
+        let bend = 1.0 + self.pitch.next() * self.recipe.bend;
         let step = (self.hz * bend / self.sample_rate).clamp(0.0, 0.49);
-        self.phase += step;
-        if self.phase >= 1.0 {
-            self.phase -= 1.0;
-        }
+        self.phase = wrap(self.phase + step);
 
-        let body = sine_turns(self.phase) * self.amp.next();
-        let click = self.rng.next_bipolar() * self.click.next();
-        body + click
+        let amp = self.amp.next();
+        let mut out = 0.0;
+        if self.recipe.body > 0.0 {
+            out += wave(self.recipe.wave, self.phase) * amp * self.recipe.body;
+        }
+        if self.recipe.partial > 0.0 {
+            self.partial_phase = wrap(self.partial_phase + step * self.recipe.partial_ratio);
+            out += wave(self.recipe.wave, self.partial_phase) * amp * self.recipe.partial;
+        }
+        if self.recipe.noise > 0.0 {
+            let n = self.rng.next_bipolar() * self.noise_env.next();
+            out += self.filter.process_mode(n, self.recipe.noise_mode) * self.recipe.noise;
+        }
+        out + self.rng.next_bipolar() * self.click.next()
+    }
+
+    /// Restarts the noise envelope `bursts` times at `burst_gap` intervals.
+    /// Three short bursts and then a tail is a clap; one is everything else.
+    fn advance_bursts(&mut self) {
+        if self.bursts_left == 0 {
+            return;
+        }
+        if self.burst_countdown > 0 {
+            self.burst_countdown -= 1;
+            return;
+        }
+        self.bursts_left -= 1;
+        let last = self.bursts_left == 0;
+        let seconds = if last {
+            self.decay_secs
+        } else {
+            self.recipe.burst_gap * 0.8
+        };
+        self.noise_env
+            .trigger(seconds, self.sample_rate, self.gain);
+        self.burst_countdown = (self.recipe.burst_gap * self.sample_rate) as u32;
     }
 
     pub fn is_silent(&self) -> bool {
@@ -218,21 +437,40 @@ impl DrumVoice {
     }
 
     fn is_active(&self) -> bool {
-        self.amp.is_active() || self.click.is_active()
+        self.amp.is_active()
+            || self.noise_env.is_active()
+            || self.click.is_active()
+            || self.bursts_left > 0
     }
 
     pub fn silence(&mut self) {
         self.amp.silence();
         self.pitch.silence();
+        self.noise_env.silence();
         self.click.silence();
+        self.filter.reset();
         self.phase = 0.0;
+        self.partial_phase = 0.0;
+        self.bursts_left = 0;
+        self.burst_countdown = 0;
     }
 }
 
-/// Sine of a phase expressed in turns (0..1), via the standard library.
-/// `synth_core` has no dependencies but is not `no_std`, so this is free.
-fn sine_turns(phase: f32) -> f32 {
-    (phase * core::f32::consts::TAU).sin()
+fn wrap(phase: f32) -> f32 {
+    if phase >= 1.0 {
+        phase - 1.0
+    } else {
+        phase
+    }
+}
+
+/// One cycle of the requested shape, from a phase in turns (0..1).
+/// `synth_core` has no dependencies but is not `no_std`, so `sin` is free.
+fn wave(shape: Wave, phase: f32) -> f32 {
+    match shape {
+        Wave::Sine => (phase * core::f32::consts::TAU).sin(),
+        Wave::Triangle => 1.0 - 4.0 * (phase - 0.5).abs(),
+    }
 }
 
 #[cfg(test)]
@@ -325,5 +563,104 @@ mod tests {
             early > late,
             "the kick's pitch did not fall: {early} crossings then {late}"
         );
+    }
+
+    /// Every pad, not just the one that was written first.
+    #[test]
+    fn every_pad_sounds_and_then_stops() {
+        for pad in Pad::ALL {
+            let mut v = DrumVoice::new(48_000.0, 7);
+            v.strike(pad, 1.0, 0.0, 1.0);
+
+            let mut peak = 0.0f32;
+            for _ in 0..24_000 {
+                peak = peak.max(v.next().abs());
+            }
+            assert!(peak > 0.05, "{} is inaudible: {peak}", pad.name());
+
+            for _ in 0..96_000 {
+                v.next();
+            }
+            assert!(v.is_silent(), "{} never released", pad.name());
+        }
+    }
+
+    /// The triple retrigger is the whole difference between a clap and a short
+    /// snare. A plain decay only ever falls, so a rise proves a retrigger.
+    #[test]
+    fn the_clap_retriggers() {
+        let mut v = DrumVoice::new(48_000.0, 3);
+        v.strike(Pad::Clap, 1.0, 0.0, 1.0);
+
+        // Peak amplitude in successive 4 ms windows across the first 60 ms.
+        let mut windows = [0.0f32; 15];
+        for w in windows.iter_mut() {
+            for _ in 0..192 {
+                *w = w.max(v.next().abs());
+            }
+        }
+        let rises = windows.windows(2).filter(|p| p[1] > p[0] * 1.2).count();
+        assert!(rises >= 2, "the clap does not retrigger: {windows:?}");
+    }
+
+    /// The spec's continuity claim, made checkable. A pad struck again while
+    /// it still rings has to *restart* — the level comes back up and a full
+    /// tail runs again — and that restart must not be a bigger jump than an
+    /// ordinary strike from silence already makes. The open hat is the pad to
+    /// measure it on: no body oscillator and no click, so the only thing a
+    /// retrigger changes is the envelope.
+    #[test]
+    fn a_mid_decay_retrigger_restarts_without_a_click() {
+        fn window(v: &mut DrumVoice, samples: usize) -> Vec<f32> {
+            (0..samples).map(|_| v.next()).collect()
+        }
+        fn peak(w: &[f32]) -> f32 {
+            w.iter().fold(0.0f32, |m, s| m.max(s.abs()))
+        }
+        fn biggest_jump(w: &[f32]) -> f32 {
+            w.windows(2).fold(0.0f32, |m, p| m.max((p[1] - p[0]).abs()))
+        }
+
+        // A strike from silence, for the size of the jump it makes on its own.
+        let mut fresh = DrumVoice::new(48_000.0, 5);
+        fresh.strike(Pad::OpenHat, 1.0, 0.0, 1.0);
+        let attack = biggest_jump(&window(&mut fresh, 480));
+
+        // The same pad, struck again 200 ms into its 380 ms tail.
+        let mut v = DrumVoice::new(48_000.0, 5);
+        v.strike(Pad::OpenHat, 1.0, 0.0, 1.0);
+        let _ = window(&mut v, 9_120);
+        let tail = window(&mut v, 480);
+        let last = *tail.last().unwrap();
+
+        v.strike(Pad::OpenHat, 1.0, 0.0, 1.0);
+        let restart = window(&mut v, 480);
+
+        assert!(
+            peak(&restart) > peak(&tail) * 5.0,
+            "the retrigger did not restart the envelope: {} then {}",
+            peak(&tail),
+            peak(&restart)
+        );
+        assert!(
+            (restart[0] - last).abs() <= attack,
+            "the retrigger jumped further than an ordinary strike: {} vs {attack}",
+            (restart[0] - last).abs()
+        );
+
+        // 500 ms further on. The old envelope would have been flushed to zero
+        // by now; the new one must not be, or the retrigger inherited the
+        // remainder of the old tail instead of starting a new one.
+        let _ = window(&mut v, 24_000);
+        assert!(!v.is_silent(), "the retrigger did not restart the tail");
+    }
+
+    /// The hats have to know they belong together; the rack acts on it later.
+    #[test]
+    fn the_hats_share_a_choke_group() {
+        assert!(Pad::ClosedHat.choke_group().is_some());
+        assert_eq!(Pad::ClosedHat.choke_group(), Pad::OpenHat.choke_group());
+        assert_eq!(Pad::Kick.choke_group(), None);
+        assert_eq!(Pad::Snare.choke_group(), None);
     }
 }
