@@ -1354,17 +1354,27 @@ mod tests {
 
     #[test]
     fn an_off_table_velocity_still_lands_on_a_valid_level() {
-        // Not hypothetical: `Cell::default().velocity` is 0.8, which is not a
-        // member of `VELOCITIES`. It survives today only because every write
-        // round-trips through `pack_column`/`unpack_column`, which quantises
-        // 0.8 down to 0.75 — `VELOCITIES[1]` — before the UI ever reads it
-        // back. This pins the fallback down directly, so a future change to
-        // the packing or to `Cell::default` can't silently strand a virgin
-        // cell's first shift-click on a value the cycle never visits again.
-        let landed = next_velocity(cell(true, Cell::default().velocity));
+        // Not hypothetical: the grid quantises to eight levels and this cycle
+        // visits three of them, so the other five all reach here — set through
+        // `Synth::set_drum_cell`, or carried in from a grid written before the
+        // cycle existed. Without the fallback a shift-click on such a cell
+        // would do nothing, forever.
+        let landed = next_velocity(cell(true, 0.625));
         assert!(
             VELOCITIES.contains(&landed),
             "an off-table velocity must fall back onto the cycle, got {landed}"
+        );
+    }
+
+    /// The cycle and the grid's default have to agree, or the very first
+    /// shift-click on an untouched cell jumps somewhere arbitrary instead of
+    /// stepping to the next level.
+    #[test]
+    fn the_grid_default_is_on_the_cycle() {
+        assert!(
+            VELOCITIES.contains(&Cell::default().velocity),
+            "Cell::default().velocity is {}, which the cycle never visits",
+            Cell::default().velocity
         );
     }
 }

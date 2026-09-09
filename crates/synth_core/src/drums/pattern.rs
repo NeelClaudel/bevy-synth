@@ -18,7 +18,11 @@ impl Default for Cell {
     fn default() -> Self {
         Self {
             active: false,
-            velocity: 0.8,
+            // Level 5 of the eight the packing quantises to. A default that
+            // sits between two levels does not survive its own round trip:
+            // 0.8 came back as 0.75, so the value a virgin cell reported and
+            // the value it kept were different numbers.
+            velocity: 0.75,
         }
     }
 }
@@ -39,27 +43,29 @@ const NIBBLE: u32 = 4;
 pub fn pack_column(column: &Column) -> u32 {
     let mut bits = 0;
     for (index, cell) in column.iter().enumerate() {
-        if !cell.active {
-            continue;
-        }
         // Eight levels spanning 0.125..=1.0, so level 7 is full velocity.
         let level = (cell.velocity.clamp(0.0, 1.0) * 8.0 - 1.0).round();
         let level = (level.max(0.0) as u32) & LEVEL_MASK;
-        bits |= (ACTIVE_BIT | level) << (index as u32 * NIBBLE);
+        // The level is written whether or not the cell fires, exactly as
+        // `pack_step` writes the melodic velocity regardless of `active`.
+        // Skipping it would zero the nibble of every silent cell, so toggling
+        // one off and on again came back at the default rather than at the
+        // level it was programmed at.
+        let active = if cell.active { ACTIVE_BIT } else { 0 };
+        bits |= (active | level) << (index as u32 * NIBBLE);
     }
     bits
 }
 
-/// Reverses [`pack_column`]. Inactive cells come back at the default velocity
-/// so a cell switched on in the UI starts somewhere sensible.
+/// Reverses [`pack_column`]. A silent cell comes back at the level it was
+/// programmed at, not at the default: that is what lets the UI toggle a cell
+/// off and on again without losing the velocity somebody set.
 pub fn unpack_column(bits: u32) -> Column {
     let mut column = Column::default();
     for (index, cell) in column.iter_mut().enumerate() {
         let nibble = (bits >> (index as u32 * NIBBLE)) & 0b1111;
-        if nibble & ACTIVE_BIT != 0 {
-            cell.active = true;
-            cell.velocity = ((nibble & LEVEL_MASK) + 1) as f32 / 8.0;
-        }
+        cell.active = nibble & ACTIVE_BIT != 0;
+        cell.velocity = ((nibble & LEVEL_MASK) + 1) as f32 / 8.0;
     }
     column
 }
@@ -169,6 +175,38 @@ mod tests {
         // Velocity quantises to eight levels, so allow half a level of drift.
         assert!((back[0].velocity - 1.0).abs() < 0.07);
         assert!((back[2].velocity - 0.5).abs() < 0.07);
+    }
+
+    /// A silent cell still carries a level. The UI toggles cells off and on
+    /// constantly, and every one of those round trips goes through the packing,
+    /// so a velocity dropped here is a velocity the player loses for good.
+    #[test]
+    fn a_silent_cell_keeps_the_velocity_it_was_programmed_at() {
+        let mut column = Column::default();
+        column[0] = Cell { active: true, velocity: 1.0 };
+        column[1] = Cell { active: false, velocity: 0.25 };
+        column[2] = Cell { active: true, velocity: 0.375 };
+        column[3] = Cell { active: false, velocity: 0.875 };
+        column[4] = Cell { active: false, velocity: 0.125 };
+
+        let back = unpack_column(pack_column(&column));
+
+        for (index, (before, after)) in column.iter().zip(back.iter()).enumerate() {
+            assert_eq!(after, before, "cell {index} did not survive the round trip");
+        }
+    }
+
+    /// The default has to be one of the eight levels the packing can hold, or
+    /// a cell nobody has touched reports one velocity and stores another.
+    #[test]
+    fn the_default_velocity_is_a_representable_level() {
+        let mut column = Column::default();
+        column[0].active = true;
+
+        let back = unpack_column(pack_column(&column));
+
+        assert_eq!(back[0].velocity, Cell::default().velocity);
+        assert_eq!(back[1], Cell::default());
     }
 
     /// Every level has to be reachable, or the quantiser has an off-by-one.

@@ -776,7 +776,11 @@ impl SharedParams {
             pad_decay: core::array::from_fn(|i| AtomicF32::new(p.pad_decay[i])),
             pad_mute: core::array::from_fn(|i| AtomicBool32::new(p.pad_mute[i])),
 
-            drum_grid: core::array::from_fn(|_| AtomicU32::new(0)),
+            // A default column rather than a zero word: the velocity nibble
+            // is meaningful for silent cells too, so all-zeroes would decode
+            // as eight cells at the softest level rather than as an untouched
+            // grid. The audio thread overwrites this on its first block.
+            drum_grid: core::array::from_fn(|_| AtomicU32::new(pack_column(&Column::default()))),
             drum_grid_len: AtomicU32::new(p.drum_length as u32),
 
             gen_enabled: AtomicBool32::new(p.gen_enabled),
