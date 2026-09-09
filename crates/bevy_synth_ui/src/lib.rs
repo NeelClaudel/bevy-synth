@@ -38,7 +38,7 @@ use synth_core::env::AdsrSettings;
 use synth_core::filter::{Slope, SvfMode};
 use synth_core::lfo::{LfoTarget, LfoWave};
 use synth_core::params::{AtomicEnum, ClockSource, VoiceMode};
-use synth_core::{NoteDivision, Pad, Scale, Waveform, PAD_COUNT};
+use synth_core::{Cell, NoteDivision, Pad, Scale, Waveform, PAD_COUNT};
 
 pub mod presets;
 pub mod widgets;
@@ -1122,6 +1122,24 @@ fn pattern_slots(ui: &mut Ui, synth: &Synth, state: &mut SynthUi) {
 /// mirror unchanged instead of drifting a step on every edit.
 const VELOCITIES: [f32; 3] = [0.375, 0.75, 1.0];
 
+/// The velocity a shift-click on this cell should land on next.
+///
+/// An inactive cell starts the cycle at its softest step, so the whole range
+/// is reachable without a plain click first. An active cell advances to the
+/// next of the three levels, wrapping past the loudest back to the softest.
+/// A velocity that is not exactly one of the three falls back to the
+/// softest rather than panicking or freezing the cycle — see the test below
+/// for why that fallback is load-bearing rather than defensive-only.
+fn next_velocity(cell: Cell) -> f32 {
+    if !cell.active {
+        return VELOCITIES[0];
+    }
+    VELOCITIES
+        .iter()
+        .position(|v| (*v - cell.velocity).abs() < 0.01)
+        .map_or(VELOCITIES[0], |i| VELOCITIES[(i + 1) % VELOCITIES.len()])
+}
+
 fn drums(ui: &mut Ui, synth: &Synth, telemetry: &SynthTelemetry, state: &mut SynthUi) {
     let p = &synth.params;
     widgets::section(ui, "DRUMS", palette::DRUM, |ui| {
@@ -1187,19 +1205,8 @@ fn drums(ui: &mut Ui, synth: &Synth, telemetry: &SynthTelemetry, state: &mut Syn
                 shift: true,
             }) => {
                 let mut cell = grid.get(step, pad);
-                // Shift-clicking a silent cell switches it on at the softest
-                // level rather than skipping ghost, so the whole cycle is
-                // reachable without a plain click first.
-                let next = if cell.active {
-                    VELOCITIES
-                        .iter()
-                        .position(|v| (*v - cell.velocity).abs() < 0.01)
-                        .map_or(0, |i| (i + 1) % VELOCITIES.len())
-                } else {
-                    0
-                };
+                cell.velocity = next_velocity(cell);
                 cell.active = true;
-                cell.velocity = VELOCITIES[next];
                 synth.set_drum_cell(step, pad, cell);
             }
             None => {}
@@ -1209,6 +1216,11 @@ fn drums(ui: &mut Ui, synth: &Synth, telemetry: &SynthTelemetry, state: &mut Syn
         ui.separator();
 
         // One pad's controls, chosen by clicking its name in the grid.
+        // `DrumHit::Select` never hands back anything outside 0..PAD_COUNT
+        // today, but `selected_pad` is plain UI state with no invariant of
+        // its own enforcing that — a saved-session field or a future second
+        // writer could hand it a stale value, and indexing pad_level/tune/
+        // decay with that would panic instead of just showing the wrong pad.
         let pad = state.selected_pad.min(PAD_COUNT - 1);
         ui.horizontal(|ui| {
             ui.label(
@@ -1318,4 +1330,41 @@ fn rand_seed() -> u64 {
         // Mix the low bits up: consecutive nanosecond values differ only in the
         // bottom few bits, and the sequencer's RNG is seeded straight from this.
         .wrapping_mul(0x2545_F491_4F6C_DD1D)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cell(active: bool, velocity: f32) -> Cell {
+        Cell { active, velocity }
+    }
+
+    #[test]
+    fn an_inactive_cell_starts_at_the_softest_level() {
+        assert_eq!(next_velocity(cell(false, 0.0)), VELOCITIES[0]);
+    }
+
+    #[test]
+    fn each_level_advances_to_the_next_and_the_last_wraps_to_the_first() {
+        assert_eq!(next_velocity(cell(true, VELOCITIES[0])), VELOCITIES[1]);
+        assert_eq!(next_velocity(cell(true, VELOCITIES[1])), VELOCITIES[2]);
+        assert_eq!(next_velocity(cell(true, VELOCITIES[2])), VELOCITIES[0]);
+    }
+
+    #[test]
+    fn an_off_table_velocity_still_lands_on_a_valid_level() {
+        // Not hypothetical: `Cell::default().velocity` is 0.8, which is not a
+        // member of `VELOCITIES`. It survives today only because every write
+        // round-trips through `pack_column`/`unpack_column`, which quantises
+        // 0.8 down to 0.75 — `VELOCITIES[1]` — before the UI ever reads it
+        // back. This pins the fallback down directly, so a future change to
+        // the packing or to `Cell::default` can't silently strand a virgin
+        // cell's first shift-click on a value the cycle never visits again.
+        let landed = next_velocity(cell(true, Cell::default().velocity));
+        assert!(
+            VELOCITIES.contains(&landed),
+            "an off-table velocity must fall back onto the cycle, got {landed}"
+        );
+    }
 }
