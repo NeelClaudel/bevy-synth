@@ -79,6 +79,15 @@ impl DrumRack {
             // is published whether or not the rack is switched on, and a
             // mirror stuck at length zero would show an empty machine.
             self.sequencer.reconcile_length(p);
+            // A pad struck just before the rack was disabled would otherwise
+            // sit frozen mid-decay — `voice.next()` is never called while
+            // disabled, so the envelope doesn't advance — and resume that
+            // stale tail the moment the rack is re-enabled. Silencing here
+            // closes that gap for the enable toggle specifically; the
+            // transport-stop sites already do this on their own paths.
+            for voice in &mut self.voices {
+                voice.silence();
+            }
             self.buffer[..frames].fill(0.0);
             return false;
         }
@@ -269,6 +278,49 @@ mod tests {
             choked_tail < free_tail * 0.5,
             "the closed hat did not choke the open one: {choked_tail} vs {free_tail}"
         );
+    }
+
+    /// Commissioned alongside Task 8's enable checkbox: `drum_enabled` can now
+    /// flip independently of the transport, and `render`'s early-return
+    /// skips `voice.next()` entirely — so without an explicit silence there,
+    /// a pad struck moments before being disabled would sit frozen
+    /// mid-decay and pick its old tail back up the instant the rack came
+    /// back on.
+    #[test]
+    fn disabling_mid_decay_does_not_resume_the_old_tail() {
+        let mut p = Params { drum_enabled: true, ..Default::default() };
+        let (mut rack, mut clock) = setup(&p);
+        // The open hat rings the longest (~380 ms), so there is plenty of
+        // tail left to leak back out if the fix is missing.
+        rack.sequencer()
+            .set_cell(0, 3, Cell { active: true, velocity: 1.0 });
+
+        // Run until the strike actually lands and the voice is audibly
+        // ringing.
+        let mut rang = false;
+        for _ in 0..250 {
+            let (_, peak) = render(&mut rack, &mut clock, &p);
+            if peak > 0.0 {
+                rang = true;
+                break;
+            }
+        }
+        assert!(rang, "the open hat never sounded before being disabled");
+
+        // Disable mid-decay: the voice is still ringing at this instant.
+        p.drum_enabled = false;
+        let (sounded, peak) = render(&mut rack, &mut clock, &p);
+        assert!(!sounded);
+        assert_eq!(peak, 0.0);
+
+        // Re-enable with nothing new landing on the grid — the next step is
+        // ~187 blocks away at this tempo, so this stays well inside step 0 —
+        // and confirm the old tail does not pick back up.
+        p.drum_enabled = true;
+        for _ in 0..20 {
+            let (_, peak) = render(&mut rack, &mut clock, &p);
+            assert_eq!(peak, 0.0, "the old tail resumed after re-enabling");
+        }
     }
 
     /// The enable switch is checked in the rack, so a disabled rack costs one
