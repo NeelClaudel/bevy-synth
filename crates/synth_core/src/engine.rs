@@ -427,11 +427,17 @@ impl Engine {
                         && self.clock.is_running()
                         && self.clock.on_midi_tick(params.steps_per_beat);
                     let seq = self.sequencer.on_midi_tick(ticked, self.clock.view(), params);
-                    if let Some(note) = seq.note_off {
-                        self.note_off(note, params);
-                    }
-                    if let Some((note, velocity)) = seq.note_on {
-                        self.note_on(note, velocity, params);
+                    // Gated exactly as `render_chunk` gates the same pair. The
+                    // sequencer still steps while muted — a mute stops the
+                    // events, not the playhead — but nothing it produces
+                    // reaches a voice.
+                    if params.melody_enabled {
+                        if let Some(note) = seq.note_off {
+                            self.note_off(note, params);
+                        }
+                        if let Some((note, velocity)) = seq.note_on {
+                            self.note_on(note, velocity, params);
+                        }
                     }
                     self.drums.on_tick(ticked, self.clock.view(), params);
                 }
@@ -1211,6 +1217,45 @@ mod tests {
             out.extend(render(&mut e, samples_per_tick as usize));
         }
         assert!(peak(&out) > 0.02, "external clock produced no notes");
+    }
+
+    /// `melody_enabled` is a mute, and until now nothing checked that it
+    /// mutes. It was only ever used in tests to get the melody out of the way
+    /// while measuring drums, which is why a gap in the external-clock path
+    /// went unnoticed for as long as it did.
+    #[test]
+    fn unticking_the_melody_silences_the_sequencer() {
+        let (mut e, tx, params) = engine();
+        params.tempo.set(140.0);
+        params.gen_density.set(1.0);
+        params.melody_enabled.set(false);
+        tx.push(Event::ClockStart);
+
+        assert_silent(&render(&mut e, 48000 * 2), "the melody played while muted");
+    }
+
+    /// The same mute, under an external MIDI clock. Every step arrives through
+    /// the `ClockTick` arm there rather than through `render_chunk`, so the two
+    /// paths have to gate on `melody_enabled` alike — otherwise unticking
+    /// "Play melody" does nothing at all for anyone slaved to a DAW.
+    #[test]
+    fn unticking_the_melody_silences_the_sequencer_under_an_external_clock() {
+        let (mut e, tx, params) = engine();
+        params.clock_source.set(ClockSource::ExternalMidi as u32);
+        params.gen_density.set(1.0);
+        params.melody_enabled.set(false);
+        tx.push(Event::ClockStart);
+
+        // 24 ticks per beat at roughly 120 BPM — the same drive as
+        // `external_clock_ticks_drive_the_sequencer`, which proves these ticks
+        // do reach the sequencer when the melody is not muted.
+        let samples_per_tick = 48000.0 * 60.0 / (120.0 * 24.0);
+        let mut out = Vec::new();
+        for _ in 0..96 {
+            tx.push(Event::ClockTick);
+            out.extend(render(&mut e, samples_per_tick as usize));
+        }
+        assert_silent(&out, "the melody played while muted under an external clock");
     }
 
     #[test]
