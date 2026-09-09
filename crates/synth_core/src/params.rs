@@ -29,6 +29,7 @@
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+use crate::drums::{pack_column, unpack_column, Column, DrumPattern, PAD_COUNT};
 use crate::env::AdsrSettings;
 use crate::filter::{Slope, SvfMode};
 use crate::fx::NoteDivision;
@@ -363,6 +364,28 @@ pub struct Params {
     /// 0.33 is a hard shuffle.
     pub seq_swing: f32,
 
+    // --- Drums ---
+    pub drum_enabled: bool,
+    /// Gates the melodic track. Separate from `seq_playing`, which stops the
+    /// clock: this mutes one track while the other keeps running.
+    pub melody_enabled: bool,
+    /// Grid length in steps, independent of `seq_length`. A two-bar drum loop
+    /// under a four-bar melody is a groove, not a mistake.
+    pub drum_length: usize,
+    pub drum_level: f32,
+    /// Sends the drum bus through delay and reverb.
+    pub drum_to_fx: bool,
+    /// Per-pad mix level.
+    pub pad_level: [f32; PAD_COUNT],
+    /// Per-pad tuning in semitones from the pad's base frequency.
+    pub pad_tune: [f32; PAD_COUNT],
+    /// Per-pad multiplier on the pad's natural decay. A multiplier rather than
+    /// absolute seconds because the pads' decays differ by an order of
+    /// magnitude and one absolute range would be unusable at both ends.
+    pub pad_decay: [f32; PAD_COUNT],
+    /// Silences a pad without disturbing its level.
+    pub pad_mute: [bool; PAD_COUNT],
+
     // --- Generative ---
     pub gen_enabled: bool,
     /// Root note as a pitch class, 0 = C.
@@ -459,6 +482,16 @@ impl Default for Params {
             seq_length: 16,
             seq_gate: 0.6,
             seq_swing: 0.0,
+
+            drum_enabled: false,
+            melody_enabled: true,
+            drum_length: 16,
+            drum_level: 0.8,
+            drum_to_fx: false,
+            pad_level: [0.8; PAD_COUNT],
+            pad_tune: [0.0; PAD_COUNT],
+            pad_decay: [1.0; PAD_COUNT],
+            pad_mute: [false; PAD_COUNT],
 
             gen_enabled: true,
             gen_root: 0,
@@ -572,6 +605,28 @@ pub struct SharedParams {
     pub seq_gate: AtomicF32,
     pub seq_swing: AtomicF32,
 
+    pub drum_enabled: AtomicBool32,
+    pub melody_enabled: AtomicBool32,
+    pub drum_length: AtomicEnum,
+    pub drum_level: AtomicF32,
+    pub drum_to_fx: AtomicBool32,
+    pub pad_level: [AtomicF32; PAD_COUNT],
+    pub pad_tune: [AtomicF32; PAD_COUNT],
+    pub pad_decay: [AtomicF32; PAD_COUNT],
+    pub pad_mute: [AtomicBool32; PAD_COUNT],
+
+    /// The grid the audio thread is actually playing, mirrored for the UI.
+    ///
+    /// One `u32` per step holds a whole column — eight pads at four bits each,
+    /// which is 32 bits precisely. A column is therefore never read half
+    /// written and the UI needs no synchronisation at all.
+    ///
+    /// Unlike `pattern`, this has no staging twin: drum edits are single cells
+    /// and travel as events, so nothing but the audio thread ever writes here.
+    pub drum_grid: [AtomicU32; crate::sequencer::MAX_STEPS],
+    /// How many columns of the mirror the engine has written.
+    pub drum_grid_len: AtomicU32,
+
     pub gen_enabled: AtomicBool32,
     pub gen_root: AtomicEnum,
     pub gen_scale: AtomicEnum,
@@ -622,6 +677,9 @@ pub struct SharedParams {
     // --- Read-only telemetry, written by the audio thread ---
     /// Current sequencer step, for UI display.
     pub current_step: AtomicU32,
+    /// Current drum step, for UI display. Separate from `current_step`
+    /// because the two grids can be different lengths.
+    pub drum_position: AtomicU32,
     /// How many voices are sounding, for UI display.
     pub active_voices: AtomicU32,
     /// Peak output level since last read, for a meter.
@@ -708,6 +766,19 @@ impl SharedParams {
             seq_gate: AtomicF32::new(p.seq_gate),
             seq_swing: AtomicF32::new(p.seq_swing),
 
+            drum_enabled: AtomicBool32::new(p.drum_enabled),
+            melody_enabled: AtomicBool32::new(p.melody_enabled),
+            drum_length: AtomicEnum::new(p.drum_length as u32),
+            drum_level: AtomicF32::new(p.drum_level),
+            drum_to_fx: AtomicBool32::new(p.drum_to_fx),
+            pad_level: core::array::from_fn(|i| AtomicF32::new(p.pad_level[i])),
+            pad_tune: core::array::from_fn(|i| AtomicF32::new(p.pad_tune[i])),
+            pad_decay: core::array::from_fn(|i| AtomicF32::new(p.pad_decay[i])),
+            pad_mute: core::array::from_fn(|i| AtomicBool32::new(p.pad_mute[i])),
+
+            drum_grid: core::array::from_fn(|_| AtomicU32::new(0)),
+            drum_grid_len: AtomicU32::new(p.drum_length as u32),
+
             gen_enabled: AtomicBool32::new(p.gen_enabled),
             gen_root: AtomicEnum::new(p.gen_root as u32),
             gen_scale: AtomicEnum::new(p.gen_scale as u32),
@@ -726,6 +797,7 @@ impl SharedParams {
             pending_request: AtomicU32::new(0),
 
             current_step: AtomicU32::new(0),
+            drum_position: AtomicU32::new(0),
             active_voices: AtomicU32::new(0),
             output_peak: AtomicF32::new(0.0),
         }
@@ -810,6 +882,16 @@ impl SharedParams {
             seq_length: (self.seq_length.get() as usize).clamp(1, crate::sequencer::MAX_STEPS),
             seq_gate: self.seq_gate.get().clamp(0.05, 2.0),
             seq_swing: self.seq_swing.get().clamp(0.0, 0.75),
+
+            drum_enabled: self.drum_enabled.get(),
+            melody_enabled: self.melody_enabled.get(),
+            drum_length: (self.drum_length.get() as usize).clamp(1, crate::sequencer::MAX_STEPS),
+            drum_level: clamp01(self.drum_level.get()),
+            drum_to_fx: self.drum_to_fx.get(),
+            pad_level: core::array::from_fn(|i| clamp01(self.pad_level[i].get())),
+            pad_tune: core::array::from_fn(|i| sane(self.pad_tune[i].get(), 0.0).clamp(-12.0, 12.0)),
+            pad_decay: core::array::from_fn(|i| sane(self.pad_decay[i].get(), 1.0).clamp(0.25, 4.0)),
+            pad_mute: core::array::from_fn(|i| self.pad_mute[i].get()),
 
             gen_enabled: self.gen_enabled.get(),
             gen_root: (self.gen_root.get() % 12) as u8,
@@ -899,6 +981,18 @@ impl SharedParams {
         self.seq_gate.set(p.seq_gate);
         self.seq_swing.set(p.seq_swing);
 
+        self.drum_enabled.set(p.drum_enabled);
+        self.melody_enabled.set(p.melody_enabled);
+        self.drum_length.set(p.drum_length as u32);
+        self.drum_level.set(p.drum_level);
+        self.drum_to_fx.set(p.drum_to_fx);
+        for i in 0..PAD_COUNT {
+            self.pad_level[i].set(p.pad_level[i]);
+            self.pad_tune[i].set(p.pad_tune[i]);
+            self.pad_decay[i].set(p.pad_decay[i]);
+            self.pad_mute[i].set(p.pad_mute[i]);
+        }
+
         self.gen_enabled.set(p.gen_enabled);
         self.gen_root.set(p.gen_root as u32);
         self.gen_scale.set(p.gen_scale as u32);
@@ -939,6 +1033,34 @@ impl SharedParams {
         let len = (self.pattern_len.load(REL) as usize).clamp(1, crate::sequencer::MAX_STEPS);
         let steps = core::array::from_fn(|i| self.read_step(i));
         crate::sequencer::Pattern::new(steps, len)
+    }
+
+    /// Publishes one column of the grid. Called by the audio thread.
+    pub fn publish_drum_column(&self, index: usize, column: &Column) {
+        if index < self.drum_grid.len() {
+            self.drum_grid[index].store(pack_column(column), REL);
+        }
+    }
+
+    /// Records how many columns the mirror now holds. Stored after the columns
+    /// themselves, for the reason `publish_len` explains.
+    pub fn publish_drum_len(&self, len: usize) {
+        self.drum_grid_len.store(len as u32, REL);
+    }
+
+    /// Reads one column back out of the mirror.
+    pub fn read_drum_column(&self, index: usize) -> Column {
+        if index >= self.drum_grid.len() {
+            return Column::default();
+        }
+        unpack_column(self.drum_grid[index].load(REL))
+    }
+
+    /// Reads the whole grid, as far as the current length.
+    pub fn read_drum_grid(&self) -> DrumPattern {
+        let len = (self.drum_grid_len.load(REL) as usize).clamp(1, crate::sequencer::MAX_STEPS);
+        let columns = core::array::from_fn(|i| self.read_drum_column(i));
+        DrumPattern::new(columns, len)
     }
 
     /// Stages a pattern for the sequencer to adopt, and asks for it. Called by
@@ -1210,5 +1332,55 @@ mod tests {
         assert_eq!(params.reverb_size, 1.0);
         assert_eq!(params.reverb_predelay, 0.25);
         assert_eq!(params.reverb_width, 0.0);
+    }
+
+    /// The drum knobs have to survive the trip out to the atomics and back,
+    /// and nonsense has to be clamped on the way: `snapshot` is the only thing
+    /// standing between a bad value and the audio thread.
+    #[test]
+    fn drum_params_round_trip_and_clamp() {
+        let shared = SharedParams::default();
+        assert!(!shared.snapshot().drum_enabled);
+
+        shared.drum_enabled.set(true);
+        shared.drum_level.set(4.0);
+        shared.drum_length.set(999);
+        shared.pad_tune[2].set(-90.0);
+        shared.pad_decay[2].set(0.0);
+        shared.pad_mute[5].set(true);
+
+        let p = shared.snapshot();
+        assert!(p.drum_enabled);
+        assert_eq!(p.drum_level, 1.0);
+        assert_eq!(p.drum_length, crate::sequencer::MAX_STEPS);
+        assert_eq!(p.pad_tune[2], -12.0);
+        assert_eq!(p.pad_decay[2], 0.25);
+        assert!(p.pad_mute[5]);
+        assert!(!p.pad_mute[0]);
+
+        // And back out again, which is what loading a patch does.
+        let restored = SharedParams::default();
+        restored.apply(&p);
+        assert!(restored.snapshot().pad_mute[5]);
+    }
+
+    /// The grid mirror is how the UI sees what the audio thread is playing.
+    #[test]
+    fn the_drum_mirror_round_trips_a_column() {
+        use crate::drums::{Cell, Column};
+
+        let shared = SharedParams::default();
+        let mut column = Column::default();
+        column[1] = Cell { active: true, velocity: 1.0 };
+
+        shared.publish_drum_column(3, &column);
+        shared.publish_drum_len(16);
+
+        let grid = shared.read_drum_grid();
+        assert_eq!(grid.len(), 16);
+        assert!(grid.get(3, 1).active);
+        assert!(!grid.get(3, 0).active);
+        assert!(!grid.get(4, 1).active);
+        assert!(grid.has_hits());
     }
 }
