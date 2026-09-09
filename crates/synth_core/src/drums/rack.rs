@@ -63,10 +63,17 @@ impl DrumRack {
     /// The external-clock path. The engine calls this from its MIDI tick
     /// handler; the strikes land on the next `render`.
     pub fn on_tick(&mut self, ticked: bool, clock: ClockView, p: &Params) {
+        let out = self.sequencer.on_tick(ticked, clock, p);
         if !p.drum_enabled {
+            // Same rule as the disabled path in `render`: a mute stops the
+            // events, not the playhead. This path carries it alone under an
+            // external clock, where `Clock::advance` reports zero steps and
+            // `render` therefore never advances anything — returning early
+            // here would freeze a muted rack against a melodic track that
+            // keeps moving. `render` still silences the voices and bypasses
+            // the bus, so dropping the strikes is all the muting this needs.
             return;
         }
-        let out = self.sequencer.on_tick(ticked, clock, p);
         self.strike(out, p);
     }
 
@@ -360,6 +367,44 @@ mod tests {
         assert_eq!(
             reference.sequencer_ref().position(),
             (steps - 1) % 16,
+            "the reference rack is not where an always-on rack should be"
+        );
+        assert_eq!(
+            muted.sequencer_ref().position(),
+            reference.sequencer_ref().position(),
+            "the muted rack came back out of time"
+        );
+    }
+
+    /// Under an external clock nothing steps through `render` — `Clock::advance`
+    /// reports zero steps for `ClockSource::ExternalMidi` — so the mute rule has
+    /// to hold on the tick path too. A rack muted while slaved to a DAW would
+    /// otherwise come back permanently behind the melody.
+    #[test]
+    fn muting_the_rack_under_an_external_clock_lands_in_time() {
+        let enabled = Params {
+            drum_enabled: true,
+            drum_length: 16,
+            clock_source: ClockSource::ExternalMidi,
+            ..Default::default()
+        };
+        let (mut reference, _) = setup(&enabled);
+        let (mut muted, mut clock) = setup(&enabled);
+
+        let mut p = enabled;
+        for step in 0..24usize {
+            // Muted across steps 2..10, as in the internal-clock twin.
+            p.drum_enabled = !(2..10).contains(&step);
+            let adv = clock.advance(BLOCK, ClockSource::ExternalMidi);
+            reference.on_tick(true, clock.view(), &enabled);
+            muted.on_tick(true, clock.view(), &p);
+            reference.render(BLOCK, adv, clock.view(), &enabled);
+            muted.render(BLOCK, adv, clock.view(), &p);
+        }
+
+        assert_eq!(
+            reference.sequencer_ref().position(),
+            23 % 16,
             "the reference rack is not where an always-on rack should be"
         );
         assert_eq!(
