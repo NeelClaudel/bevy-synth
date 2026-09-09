@@ -21,6 +21,7 @@ use egui::{
 use synth_core::env::AdsrSettings;
 use synth_core::filter::{Slope, SvfMode};
 use synth_core::params::AtomicF32;
+use synth_core::{DrumPattern, Pad, PAD_COUNT};
 
 /// The panel's colours, in one place so sections can be re-themed at once.
 pub mod palette {
@@ -45,6 +46,10 @@ pub mod palette {
     /// Effects. Teal — cool and wet against the warm oscillator and filter
     /// sections, which is roughly what the stage does to the sound.
     pub const FX: Color32 = Color32::from_rgb(94, 224, 208);
+    /// Drums. Amber and yellow are already spoken for — `FILTER` is
+    /// (255, 176, 84) and `ACCENT` is (255, 214, 102) — so the rack takes the
+    /// gap between `ENV`'s mint and `ACCENT`'s yellow.
+    pub const DRUM: Color32 = Color32::from_rgb(198, 226, 106);
 
     pub const ACCENT: Color32 = Color32::from_rgb(255, 214, 102);
     pub const DANGER: Color32 = Color32::from_rgb(255, 96, 96);
@@ -619,6 +624,138 @@ pub fn step_grid(
     });
 
     clicked
+}
+
+/// Which of a drum row's three targets the pointer hit.
+///
+/// The widget reports rather than acts: it has no `&Synth`, and the caller
+/// owns the difference between toggling a cell and cycling its velocity.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DrumHit {
+    /// A cell. `shift` means cycle the velocity instead of toggling.
+    Cell { step: usize, pad: usize, shift: bool },
+    /// The mute dot at the head of a row.
+    Mute(usize),
+    /// The pad's name, which selects it for the knobs below.
+    Select(usize),
+}
+
+/// The drum rack's pattern: eight labelled rows by `grid.len()` columns.
+///
+/// Unlike `step_grid` this does not wrap at sixteen. A row is a pad, and a pad
+/// broken across two rows stops being readable as one instrument — so a long
+/// pattern gets wide instead, and the panel's scroll area carries it.
+pub fn drum_grid(
+    ui: &mut Ui,
+    grid: &DrumPattern,
+    current: usize,
+    playing: bool,
+    muted: &[bool; PAD_COUNT],
+    selected: usize,
+) -> Option<DrumHit> {
+    let mut hit = None;
+
+    const CELL: Vec2 = Vec2::new(22.0, 20.0);
+    const NAME_WIDTH: f32 = 58.0;
+
+    // Read once, outside the loop: the modifier belongs to the click, and
+    // asking egui per cell would be the same answer sixty-four times a row.
+    let shift = ui.input(|i| i.modifiers.shift);
+
+    ui.vertical(|ui| {
+        for (pad, &pad_muted) in muted.iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+
+                // Mute and select are two targets, not one. A single label
+                // doing both would mean every attempt to look at a pad's decay
+                // silenced it.
+                let (dot, dot_response) =
+                    ui.allocate_exact_size(Vec2::splat(12.0), Sense::click());
+                if dot_response.clicked() {
+                    hit = Some(DrumHit::Mute(pad));
+                }
+                let colour = if pad_muted {
+                    palette::TRACK
+                } else {
+                    palette::DRUM
+                };
+                ui.painter_at(dot).circle_filled(dot.center(), 4.0, colour);
+                dot_response.on_hover_text("mute this pad");
+
+                let (name, name_response) =
+                    ui.allocate_exact_size(Vec2::new(NAME_WIDTH, CELL.y), Sense::click());
+                if name_response.clicked() {
+                    hit = Some(DrumHit::Select(pad));
+                }
+                let painter = ui.painter_at(name);
+                if pad == selected {
+                    painter.rect_filled(name, 3.0, palette::TRACK);
+                }
+                painter.text(
+                    Pos2::new(name.left() + 5.0, name.center().y),
+                    Align2::LEFT_CENTER,
+                    Pad::from_u32(pad as u32).name(),
+                    FontId::monospace(9.5),
+                    if pad_muted {
+                        palette::TEXT_DIM
+                    } else {
+                        palette::TEXT
+                    },
+                );
+
+                for step in 0..grid.len() {
+                    let cell = grid.get(step, pad);
+                    let (rect, response) = ui.allocate_exact_size(CELL, Sense::click());
+                    if response.clicked() {
+                        hit = Some(DrumHit::Cell { step, pad, shift });
+                    }
+
+                    let painter = ui.painter_at(rect);
+                    let background = if cell.active {
+                        // Velocity as brightness. The three levels shift-click
+                        // cycles through have to be tellable apart at a glance,
+                        // and a number in a 22-pixel box is not readable.
+                        let lit = palette::DRUM.gamma_multiply(0.3 + 0.7 * cell.velocity);
+                        if pad_muted {
+                            lit.gamma_multiply(0.3)
+                        } else {
+                            lit
+                        }
+                    } else if step % 4 == 0 {
+                        // Downbeats stay visible when empty, so the bar
+                        // structure is readable in a sparse pattern.
+                        palette::TRACK
+                    } else {
+                        palette::PANEL
+                    };
+                    painter.rect_filled(rect, 3.0, background);
+
+                    // The playhead is an outline rather than a fill, so it
+                    // stays legible over a lit cell instead of replacing it —
+                    // which would hide the velocity exactly when playing.
+                    if playing && step == current {
+                        painter.rect_stroke(
+                            rect,
+                            3.0,
+                            Stroke::new(1.5, palette::ACCENT),
+                            egui::StrokeKind::Inside,
+                        );
+                    } else if response.hovered() {
+                        painter.rect_stroke(
+                            rect,
+                            3.0,
+                            Stroke::new(1.0, palette::TEXT),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                }
+            });
+            ui.add_space(2.0);
+        }
+    });
+
+    hit
 }
 
 /// A clickable piano keyboard.

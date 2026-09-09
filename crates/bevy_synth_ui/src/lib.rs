@@ -38,7 +38,7 @@ use synth_core::env::AdsrSettings;
 use synth_core::filter::{Slope, SvfMode};
 use synth_core::lfo::{LfoTarget, LfoWave};
 use synth_core::params::{AtomicEnum, ClockSource, VoiceMode};
-use synth_core::{NoteDivision, Scale, Waveform};
+use synth_core::{NoteDivision, Pad, Scale, Waveform, PAD_COUNT};
 
 pub mod presets;
 pub mod widgets;
@@ -97,6 +97,12 @@ pub struct SynthUi {
     slots: [Option<synth_core::Pattern>; SLOTS],
     /// The slot last loaded or saved, shown highlighted.
     active_slot: Option<usize>,
+    /// The pad whose knobs are showing.
+    ///
+    /// One pad's controls at a time. The alternative is twenty-four knobs on
+    /// screen at once, which is the wall of sliders this panel's own design
+    /// notes exist to avoid.
+    selected_pad: usize,
 }
 
 /// Enough to hold a verse, a chorus and a couple of alternatives, which is as
@@ -115,6 +121,7 @@ impl Default for SynthUi {
             meter_hold: 0.0,
             slots: [None; SLOTS],
             active_slot: None,
+            selected_pad: 0,
         }
     }
 }
@@ -254,7 +261,7 @@ fn panel(
 
     let mut open = ui_state.open;
     egui::Window::new("Synth")
-        .default_size([980.0, 700.0])
+        .default_size([980.0, 860.0])
         // Keep the window inside the viewport. Without this it can open — or be
         // dragged — mostly off-screen, with no way to get hold of it again.
         .constrain(true)
@@ -280,6 +287,8 @@ fn panel(
 
                 ui.add_space(2.0);
                 sequencer(ui, &synth, &telemetry, &mut ui_state);
+                ui.add_space(2.0);
+                drums(ui, &synth, &telemetry, &mut ui_state);
                 ui.add_space(2.0);
                 keyboard(ui, &synth, &mut ui_state);
             });
@@ -943,6 +952,15 @@ fn sequencer(ui: &mut Ui, synth: &Synth, telemetry: &SynthTelemetry, state: &mut
                         integer(ui, &p.seq_length, 1..=64, " steps");
                     });
                 });
+
+                let mut melody = p.melody_enabled.get();
+                if ui
+                    .checkbox(&mut melody, "Play melody")
+                    .on_hover_text("mute the melodic track without stopping the clock")
+                    .changed()
+                {
+                    p.melody_enabled.set(melody);
+                }
             });
         });
 
@@ -1094,6 +1112,151 @@ fn pattern_slots(ui: &mut Ui, synth: &Synth, state: &mut SynthUi) {
             state.slots[target] = Some(pattern);
             state.active_slot = Some(target);
         }
+    });
+}
+
+/// The three velocity levels shift-click cycles through.
+///
+/// Each is exact in the grid's three-bit packing — 0.375, 0.75 and 1.0 are
+/// levels 2, 5 and 7 of eight — so a cycled cell round-trips through the
+/// mirror unchanged instead of drifting a step on every edit.
+const VELOCITIES: [f32; 3] = [0.375, 0.75, 1.0];
+
+fn drums(ui: &mut Ui, synth: &Synth, telemetry: &SynthTelemetry, state: &mut SynthUi) {
+    let p = &synth.params;
+    widgets::section(ui, "DRUMS", palette::DRUM, |ui| {
+        ui.horizontal(|ui| {
+            let mut enabled = p.drum_enabled.get();
+            if ui
+                .checkbox(&mut enabled, "Enable")
+                .on_hover_text("off by default, so an existing patch sounds exactly as it did")
+                .changed()
+            {
+                p.drum_enabled.set(enabled);
+            }
+
+            let mut to_fx = p.drum_to_fx.get();
+            if ui
+                .checkbox(&mut to_fx, "Through FX")
+                .on_hover_text("send the drum bus through delay and reverb instead of past them")
+                .changed()
+            {
+                p.drum_to_fx.set(to_fx);
+            }
+
+            ui.label(
+                egui::RichText::new("Length")
+                    .color(palette::TEXT_DIM)
+                    .size(10.0),
+            );
+            integer(ui, &p.drum_length, 1..=64, " steps");
+        });
+
+        ui.add_space(4.0);
+
+        let muted: [bool; PAD_COUNT] = core::array::from_fn(|i| p.pad_mute[i].get());
+        // Bound to a local so the snapshot lives for the whole draw, and so
+        // the shift-click arm below reads the same grid the user clicked on.
+        let grid = synth.drum_grid();
+        let hit = widgets::drum_grid(
+            ui,
+            &grid,
+            telemetry.drum_step as usize,
+            p.seq_playing.get(),
+            &muted,
+            state.selected_pad,
+        );
+
+        match hit {
+            Some(widgets::DrumHit::Mute(pad)) => {
+                p.pad_mute[pad].set(!muted[pad]);
+            }
+            Some(widgets::DrumHit::Select(pad)) => {
+                state.selected_pad = pad;
+            }
+            Some(widgets::DrumHit::Cell {
+                step,
+                pad,
+                shift: false,
+            }) => {
+                synth.toggle_drum_cell(step, pad);
+            }
+            Some(widgets::DrumHit::Cell {
+                step,
+                pad,
+                shift: true,
+            }) => {
+                let mut cell = grid.get(step, pad);
+                // Shift-clicking a silent cell switches it on at the softest
+                // level rather than skipping ghost, so the whole cycle is
+                // reachable without a plain click first.
+                let next = if cell.active {
+                    VELOCITIES
+                        .iter()
+                        .position(|v| (*v - cell.velocity).abs() < 0.01)
+                        .map_or(0, |i| (i + 1) % VELOCITIES.len())
+                } else {
+                    0
+                };
+                cell.active = true;
+                cell.velocity = VELOCITIES[next];
+                synth.set_drum_cell(step, pad, cell);
+            }
+            None => {}
+        }
+
+        ui.add_space(4.0);
+        ui.separator();
+
+        // One pad's controls, chosen by clicking its name in the grid.
+        let pad = state.selected_pad.min(PAD_COUNT - 1);
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(Pad::from_u32(pad as u32).name())
+                    .color(palette::TEXT)
+                    .size(10.0)
+                    .strong(),
+            );
+            widgets::knob_param(
+                ui,
+                &KnobSpec::new("Level", 0.0..=1.0)
+                    .colour(palette::DRUM)
+                    .default(0.8)
+                    .size(36.0),
+                &p.pad_level[pad],
+            );
+            widgets::knob_param(
+                ui,
+                &KnobSpec::new("Tune", -12.0..=12.0)
+                    .colour(palette::DRUM)
+                    .unit("st")
+                    .default(0.0)
+                    .size(36.0),
+                &p.pad_tune[pad],
+            )
+            .on_hover_text("semitones from the pad's own base frequency");
+            widgets::knob_param(
+                ui,
+                &KnobSpec::new("Decay", 0.25..=4.0)
+                    .colour(palette::DRUM)
+                    .unit("x")
+                    .default(1.0)
+                    .size(36.0),
+                &p.pad_decay[pad],
+            )
+            .on_hover_text("multiplier on the pad's natural decay, not a time in seconds");
+
+            ui.separator();
+            widgets::knob_param(
+                ui,
+                &KnobSpec::new("Bus", 0.0..=1.0)
+                    .colour(palette::DRUM)
+                    .default(0.8)
+                    .size(36.0),
+                &p.drum_level,
+            )
+            .on_hover_text("level of the whole rack, after the per-pad levels");
+        });
     });
 }
 

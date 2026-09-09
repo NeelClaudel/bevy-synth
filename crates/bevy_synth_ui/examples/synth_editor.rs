@@ -27,7 +27,7 @@ fn main() {
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 title: "bevy_synth".into(),
-                resolution: (1000, 760).into(),
+                resolution: (1000, 900).into(),
                 ..default()
             }),
             ..default()

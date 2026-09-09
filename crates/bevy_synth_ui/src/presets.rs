@@ -442,11 +442,20 @@ mod tests {
     }
 
     #[test]
-    fn presets_leave_the_sequencer_alone() {
+    fn presets_leave_the_sequencer_and_the_drums_alone() {
         let params = SharedParams::default();
         params.tempo.set(174.0);
         params.gen_root.set(7);
         params.seq_length.set(32);
+
+        // The drums are the piece, not the patch. A preset that reached in
+        // here would retune the kit every time the user auditioned a sound.
+        params.drum_enabled.set(true);
+        params.drum_length.set(12);
+        params.drum_level.set(0.4);
+        params.pad_tune[0].set(-5.0);
+        params.pad_decay[0].set(2.0);
+        params.pad_mute[3].set(true);
 
         for preset in ALL {
             (preset.apply)(&params);
@@ -455,6 +464,13 @@ mod tests {
         assert_eq!(params.tempo.get(), 174.0);
         assert_eq!(params.gen_root.get(), 7);
         assert_eq!(params.seq_length.get(), 32);
+
+        assert!(params.drum_enabled.get(), "a preset switched the rack off");
+        assert_eq!(params.drum_length.get(), 12);
+        assert_eq!(params.drum_level.get(), 0.4);
+        assert_eq!(params.pad_tune[0].get(), -5.0);
+        assert_eq!(params.pad_decay[0].get(), 2.0);
+        assert!(params.pad_mute[3].get());
     }
 
     #[test]
