@@ -75,10 +75,15 @@ impl DrumRack {
     pub fn render(&mut self, frames: usize, adv: Advance, clock: ClockView, p: &Params) -> bool {
         let frames = frames.min(BLOCK);
         if !p.drum_enabled {
-            // Still track the length knob. The grid mirror the UI draws from
-            // is published whether or not the rack is switched on, and a
+            // Sequence the block and throw the hits away. A mute stops the
+            // events, not the playhead: the spec asks that unmuting four bars
+            // later come back in time rather than at the top, and the melodic
+            // track keeps advancing while muted, so a rack that froze here
+            // would be permanently out of phase with it afterwards. This also
+            // keeps tracking the length knob — the grid mirror the UI draws
+            // from is published whether or not the rack is switched on, and a
             // mirror stuck at length zero would show an empty machine.
-            self.sequencer.reconcile_length(p);
+            let _ = self.sequencer.advance(frames, adv, clock, p);
             // A pad struck just before the rack was disabled would otherwise
             // sit frozen mid-decay — `voice.next()` is never called while
             // disabled, so the envelope doesn't advance — and resume that
@@ -321,6 +326,47 @@ mod tests {
             let (_, peak) = render(&mut rack, &mut clock, &p);
             assert_eq!(peak, 0.0, "the old tail resumed after re-enabling");
         }
+    }
+
+    /// The spec is explicit about what a mute is
+    /// (`docs/superpowers/specs/2026-09-09-drum-rack-design.md`): "A mute
+    /// stops a sequencer producing events; it does not stop the clock or reset
+    /// the position. Muting a track and unmuting it four bars later comes back
+    /// in time rather than at the top." A rack that stopped advancing while
+    /// disabled came back however many steps behind it had been muted for, and
+    /// stayed permanently out of phase with the melodic track — which does keep
+    /// advancing — for the rest of the session.
+    #[test]
+    fn muting_the_rack_and_coming_back_lands_in_time() {
+        let enabled = Params { drum_enabled: true, drum_length: 16, ..Default::default() };
+        let (mut reference, _) = setup(&enabled);
+        let (mut muted, mut clock) = setup(&enabled);
+
+        // Both racks read the same advance from the same clock, exactly as the
+        // engine drives one; only `drum_enabled` differs between them.
+        let mut p = enabled;
+        let mut steps = 0usize;
+        for _ in 0..12_000 {
+            let adv = clock.advance(BLOCK, ClockSource::Internal);
+            steps += adv.steps as usize;
+            // Muted across steps 2..10 — most of a bar, long enough that a
+            // frozen playhead is unmistakable.
+            p.drum_enabled = !(2..10).contains(&steps);
+            reference.render(BLOCK, adv, clock.view(), &enabled);
+            muted.render(BLOCK, adv, clock.view(), &p);
+        }
+
+        assert!(steps > 12, "the clock never ran past the mute: {steps}");
+        assert_eq!(
+            reference.sequencer_ref().position(),
+            (steps - 1) % 16,
+            "the reference rack is not where an always-on rack should be"
+        );
+        assert_eq!(
+            muted.sequencer_ref().position(),
+            reference.sequencer_ref().position(),
+            "the muted rack came back out of time"
+        );
     }
 
     /// The enable switch is checked in the rack, so a disabled rack costs one
