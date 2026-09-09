@@ -340,8 +340,6 @@ pub struct SynthTelemetry {
     pub step_changed: bool,
     /// Drum grid column currently playing.
     pub drum_step: u32,
-    /// Whether the drum column changed this frame.
-    pub drum_step_changed: bool,
     /// How many voices are sounding.
     pub active_voices: u32,
     /// Peak output level since the last frame, `0.0..=1.0`. Drives a meter, or
@@ -355,9 +353,7 @@ fn read_telemetry(synth: Res<Synth>, mut telemetry: ResMut<SynthTelemetry>) {
     let step = synth.params.current_step.load(Relaxed);
     telemetry.step_changed = step != telemetry.current_step;
     telemetry.current_step = step;
-    let drum_step = synth.params.drum_position.load(Relaxed);
-    telemetry.drum_step_changed = drum_step != telemetry.drum_step;
-    telemetry.drum_step = drum_step;
+    telemetry.drum_step = synth.params.drum_position.load(Relaxed);
     telemetry.active_voices = synth.params.active_voices.load(Relaxed);
     // `take_peak` resets the meter, so each frame reports the peak since the
     // last one rather than an all-time high that never falls.
