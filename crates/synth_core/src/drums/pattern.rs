@@ -68,8 +68,8 @@ pub fn unpack_column(bits: u32) -> Column {
 ///
 /// Returned by copy for the same reason [`crate::sequencer::Pattern`] is: the
 /// real grid lives on the audio thread, and lending a reference to it would
-/// need a lock. Two kilobytes on the stack is far cheaper than that lock, and
-/// the UI gets a snapshot that cannot change underneath it mid-frame.
+/// need a lock. Four kilobytes on the stack is far cheaper than that lock,
+/// and the UI gets a snapshot that cannot change underneath it mid-frame.
 #[derive(Debug, Clone, Copy)]
 pub struct DrumPattern {
     columns: [Column; MAX_STEPS],
@@ -215,5 +215,26 @@ mod tests {
         assert!(!grid.has_hits());
         assert!(!grid.get(999, 99).active);
         assert_eq!(DrumPattern::default().len(), 0);
+    }
+
+    /// `len` is the one guard between a corrupted length and an out-of-bounds
+    /// slice on the audio thread, so both `new` and `set_len` must clamp it —
+    /// exactly at `MAX_STEPS` and past it, not just for values that already fit.
+    #[test]
+    fn length_is_clamped_to_max_steps() {
+        let columns = [Column::default(); MAX_STEPS];
+
+        let at_max = DrumPattern::new(columns, MAX_STEPS);
+        assert_eq!(at_max.len(), MAX_STEPS);
+        assert_eq!(at_max.iter().count(), MAX_STEPS);
+
+        let over_max = DrumPattern::new(columns, 1000);
+        assert_eq!(over_max.len(), MAX_STEPS);
+        assert_eq!(over_max.iter().count(), MAX_STEPS);
+
+        let mut grid = DrumPattern::default();
+        grid.set_len(1000);
+        assert_eq!(grid.len(), MAX_STEPS);
+        assert_eq!(grid.iter().count(), MAX_STEPS);
     }
 }
