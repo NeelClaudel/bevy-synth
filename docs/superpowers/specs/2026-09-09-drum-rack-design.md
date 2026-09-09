@@ -49,11 +49,16 @@ sends them to the effects.
 `Clock` moves from `Sequencer` into `Engine`. `Sequencer::advance` today takes a
 sample count and advances the clock itself; it becomes:
 
-    fn advance(&mut self, adv: Advance, phase: f32, p: &Params) -> SeqOutput
+    fn advance(&mut self, samples: usize, adv: Advance, clock: ClockView,
+               p: &Params) -> SeqOutput
 
 `Advance` is already `{ steps: u32 }` and `Copy`, so handing the same value to
-two sequencers copies four bytes. `Clock::phase()` is passed alongside it
-because both sequencers need it for gate length and swing.
+two sequencers copies four bytes. `samples` stays: the gate countdown and the
+swing countdown are both measured in samples, and neither can be recovered from
+a step count. `ClockView` is a two-field `Copy` struct carrying what the clock
+knows and the sequencers need — `samples_per_step: f32`, which scales gate
+length and swing delay, and `running: bool`, which decides whether a queued
+pattern lands now or at the next bar line.
 
 `Engine::process_block` advances the clock once, then calls each sequencer with
 the result. This is the whole reason for the refactor: with the clock inside one
@@ -86,7 +91,7 @@ exactly today's behaviour.
 A mute stops a sequencer producing events; it does not stop the clock or reset
 the position. Muting a track and unmuting it four bars later comes back in time
 rather than at the top, which is what a mute is for. Muting the melody releases
-any sounding note through the existing `release_all`.
+any sounding note through the existing `all_notes_off`.
 
 ## Signal path
 
@@ -124,21 +129,24 @@ hard-bypass at zero mix. This is what keeps the dry path bit-identical.
 
 | File | Contents |
 |---|---|
-| `voice.rs` | `DrumVoice` and the eight synthesis routines |
-| `pattern.rs` | `Pad`, `Cell`, `DrumPattern`, `DrumGenSettings` |
+| `voice.rs` | `Pad`, `Decay`, `DrumVoice` and the eight synthesis routines |
+| `pattern.rs` | `Cell`, `Column`, `DrumPattern`, `DrumGenSettings` |
 | `sequencer.rs` | `DrumSequencer` |
-| `mod.rs` | `DrumRack`, owning the eight voices and the sequencer |
+| `rack.rs` | `DrumRack`, owning the eight voices and the sequencer |
+| `mod.rs` | Declares the submodules and re-exports their public names |
 
 One entry point is all `engine.rs` calls:
 
-    fn render_block(&mut self, frames: usize, adv: Advance, phase: f32,
-                    p: &Params) -> &[f32]
+    fn render(&mut self, frames: usize, adv: Advance, clock: ClockView,
+              p: &Params) -> bool
+    fn output(&self, frames: usize) -> &[f32]
 
-It fills the rack's own mono scratch buffer and hands back `frames` samples of
-it. The engine sums that slice into `left` and `right` at whichever point
-`drum_to_fx` selects, so the routing decision stays in `render_chunk` where the
-rest of the signal path already lives, rather than being split across two
-crates' worth of buffer plumbing.
+`render` fills the rack's own mono scratch buffer and returns whether it wrote
+anything; `output` hands back that slice. Split in two so the engine calls
+`render` exactly once per block — advancing the drum sequencer once — and then
+reads the slice at whichever point `drum_to_fx` selects. The routing decision
+stays in `render_chunk` where the rest of the signal path already lives, rather
+than being split across two crates' worth of buffer plumbing.
 
 The scratch buffer is `[f32; BLOCK]`, allocated in `DrumRack::new` like every
 other buffer the rack owns; `render_chunk` never asks for more than `BLOCK`
@@ -252,8 +260,9 @@ existing `widgets::section` and `KnobSpec` helpers. One pad's controls at a
 time: twenty-four knobs on screen at once would be the wall of sliders the
 panel's own design notes argue against.
 
-One new palette constant for the drums, in the amber range, which no existing
-entry occupies.
+One new palette constant for the drums. Amber and yellow are taken — `FILTER`
+is `(255, 176, 84)` and `ACCENT` is `(255, 214, 102)` — so the drums take the
+gap between `ENV`'s mint and `ACCENT`'s yellow: a lime `(198, 226, 106)`.
 
 The four control columns reflow to whatever width the window has, so a fifth
 would be the wrong shape for the grid anyway: it is wide rather than tall. It
