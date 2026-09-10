@@ -866,8 +866,25 @@ mod tests {
         out
     }
 
+    /// `frames` frames of interleaved stereo, so `2 * frames` floats. The
+    /// mono `render` collapses the buses, which is fine for level and
+    /// bit-identity checks but hides everything about the stereo topology.
+    fn render_stereo(engine: &mut Engine, frames: usize) -> Vec<f32> {
+        let mut out = vec![0.0; frames * 2];
+        engine.process_stereo_interleaved(&mut out);
+        out
+    }
+
     fn peak(buffer: &[f32]) -> f32 {
         buffer.iter().fold(0.0f32, |a, &b| a.max(b.abs()))
+    }
+
+    /// Equality on the bits, not on the values. `assert_eq!` over `f32` says
+    /// `-0.0 == 0.0`, which is the wrong answer whenever a test's claim is
+    /// that a path was left untouched — the same standard the golden vector
+    /// holds the dry path to.
+    fn bit_identical(a: &[f32], b: &[f32]) -> bool {
+        a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.to_bits() == y.to_bits())
     }
 
     /// The bypass, stated as a test. Two engines rendering the same melody,
@@ -1669,12 +1686,13 @@ mod tests {
         let (mut dry_engine, tx_dry) = engine_preset(|p| {
             p.seq_playing.set(false);
             p.master_gain.set(1.0);
+            p.delay_time.set(0.01);
         });
         tx_dry.push(Event::NoteOn {
             note: 60,
             velocity: 0.8,
         });
-        let dry = render(&mut dry_engine, 4096);
+        let dry = render_stereo(&mut dry_engine, 4096);
 
         // The same signal through a fresh chain, as an insert.
         let mut l: Vec<f32> = dry.iter().step_by(2).copied().collect();
@@ -1682,6 +1700,16 @@ mod tests {
         let mut chain = crate::fx::FxChain::new(48_000.0);
         let mut reference_params = Params::default();
         reference_params.delay_mix = 0.5;
+        // 0.375 s is 18 000 samples at 48 kHz: over a 4096-frame window the
+        // delay line never fills and the chain degenerates into a memoryless
+        // multiply by `1 - mix`, which a scrambled or channel-swapped return
+        // would satisfy just as well. At 0.01 s it rings inside the window.
+        reference_params.delay_time = 0.01;
+        // A centred note through the delay alone comes out with `l == r`, and a
+        // channel-swapped return is then unobservable. The plate's two channels
+        // are built from different tap lengths, so it decorrelates them and the
+        // swap has somewhere to show up.
+        reference_params.reverb_mix = 0.5;
         for (cl, cr) in l.chunks_mut(BLOCK).zip(r.chunks_mut(BLOCK)) {
             chain.process_block(cl, cr, &reference_params, reference_params.tempo);
         }
@@ -1692,16 +1720,27 @@ mod tests {
             p.master_gain.set(1.0);
             p.synth_send.set(1.0);
             p.delay_mix.set(0.5);
+            p.delay_time.set(0.01);
+            p.reverb_mix.set(0.5);
         });
         tx_wet.push(Event::NoteOn {
             note: 60,
             velocity: 0.8,
         });
-        let wet = render(&mut wet_engine, 4096);
+        let wet = render_stereo(&mut wet_engine, 4096);
 
         // Sanity: the delay actually did something, or this proves nothing.
         assert!(peak(&wet) > 0.0);
-        assert_ne!(wet, dry, "the delay was inaudible; the test is vacuous");
+        let moved = wet
+            .iter()
+            .zip(dry.iter())
+            .fold(0.0f32, |a, (w, d)| a.max((w - d * 0.5).abs()));
+        assert!(moved > 1.0e-3, "the delay was inaudible; the test is vacuous: {moved:e}");
+        let spread = l
+            .iter()
+            .zip(r.iter())
+            .fold(0.0f32, |a, (x, y)| a.max((x - y).abs()));
+        assert!(spread > 1.0e-3, "the reference is mono; a channel swap would pass: {spread:e}");
 
         for (i, sample) in wet.iter().enumerate() {
             let want = if i % 2 == 0 { l[i / 2] } else { r[i / 2] };
@@ -1783,12 +1822,30 @@ mod tests {
             p.delay_mix.set(1.0);
             p.pad_send[0].set(0.0);
         });
-        for tx in [&tx_sent, &tx_held] {
+        // The same engine again with the return itself shut. An empty return
+        // adds exactly `+0.0`, so if pad 0 really is held out of the send then
+        // `held_back` has to come out bit-for-bit equal to this.
+        let (mut closed, tx_closed) = engine_preset(|p| {
+            p.melody_enabled.set(false);
+            p.drum_enabled.set(true);
+            p.drum_send.set(1.0);
+            p.delay_mix.set(0.0);
+            p.pad_send[0].set(0.0);
+        });
+        for tx in [&tx_sent, &tx_held, &tx_closed] {
             kick_on_one(tx);
             tx.push(Event::ClockStart);
         }
 
-        assert_ne!(render(&mut sent, 8192), render(&mut held_back, 8192));
+        let sent_out = render(&mut sent, 8192);
+        let held_out = render(&mut held_back, 8192);
+        let closed_out = render(&mut closed, 8192);
+        // Anti-vacuity: the return is audible when pad 0 is allowed into it.
+        assert_ne!(sent_out, held_out);
+        assert!(
+            bit_identical(&held_out, &closed_out),
+            "muting pad 0 out of the send left something in the return"
+        );
     }
 
     /// A compressor whose detector never crosses the threshold computes
@@ -1815,7 +1872,12 @@ mod tests {
             tx.push(Event::ClockStart);
         }
 
-        assert_eq!(render(&mut armed, 4096), render(&mut bypassed, 4096));
+        // `assert_eq!` would not say this: `-0.0 == 0.0` is true, so a sign
+        // flip would slip through a claim of identity.
+        assert!(
+            bit_identical(&render(&mut armed, 4096), &render(&mut bypassed, 4096)),
+            "the armed sidechain moved the output"
+        );
     }
 
     /// The point of the whole feature: pad 0 ducks the synth. Both engines
