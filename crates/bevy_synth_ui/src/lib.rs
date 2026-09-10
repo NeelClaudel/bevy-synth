@@ -69,10 +69,46 @@ impl Plugin for SynthUiPlugin {
     }
 }
 
+/// The panel's three top-level pages.
+///
+/// The panel is a patch editor and a pattern editor and a drum machine, and
+/// those are three different jobs done at three different times. Stacked on
+/// one surface they made a window taller than a laptop screen, so every job
+/// was done through a scrollbar. Tabbed, each one fits.
+///
+/// Transport and mixer stay outside the tabs: they are the controls you reach
+/// for *while* doing any of the three.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Tab {
+    /// Oscillators through effects: the sound itself.
+    #[default]
+    Synth,
+    /// The step sequencer and its pattern slots.
+    Sequencer,
+    /// The drum rack.
+    Drums,
+}
+
+impl Tab {
+    /// Left to right, in the order the signal is usually built up.
+    pub const ALL: [Self; 3] = [Self::Synth, Self::Sequencer, Self::Drums];
+
+    /// The label on the tab.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Synth => "SYNTH",
+            Self::Sequencer => "SEQ",
+            Self::Drums => "DRUMS",
+        }
+    }
+}
+
 /// Panel state that is the UI's own, not the synth's.
 #[derive(Resource)]
 pub struct SynthUi {
     pub open: bool,
+    /// The page currently showing.
+    pub tab: Tab,
     /// Lowest note shown on the on-screen keyboard.
     pub keyboard_base: u8,
     pub keyboard_octaves: u32,
@@ -111,6 +147,7 @@ impl Default for SynthUi {
     fn default() -> Self {
         Self {
             open: true,
+            tab: Tab::default(),
             // C3, so two octaves reaches middle C and the octave above it.
             keyboard_base: 48,
             keyboard_octaves: 3,
@@ -255,7 +292,7 @@ fn panel(
 
     let mut open = ui_state.open;
     egui::Window::new("Synth")
-        .default_size([980.0, 860.0])
+        .default_size([980.0, 620.0])
         // Keep the window inside the viewport. Without this it can open — or be
         // dragged — mostly off-screen, with no way to get hold of it again.
         .constrain(true)
@@ -272,22 +309,46 @@ fn panel(
 
             // Whatever the window size, everything stays reachable. The columns
             // reflow to fit the width; this catches what is left over, mostly
-            // height: the full panel is taller than a laptop screen.
+            // height: a tab's contents can still outgrow a short window.
             egui::ScrollArea::both().show(ui, |ui| {
                 sections::transport(ui, &synth, &telemetry, &mut ui_state);
                 ui.add_space(2.0);
+                sections::mixer(ui, &synth, &telemetry, &mut ui_state);
+                ui.add_space(4.0);
 
-                synth_columns(ui, &synth, visible_width);
+                tab_bar(ui, &mut ui_state);
+                ui.add_space(4.0);
 
-                ui.add_space(2.0);
-                sections::sequencer(ui, &synth, &telemetry, &mut ui_state);
-                ui.add_space(2.0);
-                sections::drums(ui, &synth, &telemetry, &mut ui_state);
-                ui.add_space(2.0);
-                sections::keyboard(ui, &synth, &mut ui_state);
+                match ui_state.tab {
+                    Tab::Synth => {
+                        synth_columns(ui, &synth, visible_width);
+                        ui.add_space(2.0);
+                        sections::keyboard(ui, &synth, &mut ui_state);
+                    }
+                    Tab::Sequencer => sections::sequencer(ui, &synth, &telemetry, &mut ui_state),
+                    Tab::Drums => sections::drums(ui, &synth, &telemetry, &mut ui_state),
+                }
             });
         });
     ui_state.open = open;
+}
+
+/// The row of page buttons under the mixer.
+fn tab_bar(ui: &mut Ui, state: &mut SynthUi) {
+    ui.horizontal(|ui| {
+        for tab in Tab::ALL {
+            let selected = state.tab == tab;
+            if ui
+                .selectable_label(
+                    selected,
+                    egui::RichText::new(tab.name()).size(11.0).strong(),
+                )
+                .clicked()
+            {
+                state.tab = tab;
+            }
+        }
+    });
 }
 
 /// The four columns of synth controls, wrapped onto as many rows as `width`

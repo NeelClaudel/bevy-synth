@@ -149,26 +149,6 @@ pub(crate) fn drums(ui: &mut Ui, synth: &Synth, telemetry: &SynthTelemetry, stat
                 &p.pad_decay[pad],
             )
             .on_hover_text("multiplier on the pad's natural decay, not a time in seconds");
-
-            ui.separator();
-            widgets::knob_param(
-                ui,
-                &KnobSpec::new("Bus", 0.0..=1.0)
-                    .colour(palette::DRUM)
-                    .default(0.8)
-                    .size(36.0),
-                &p.drum_level,
-            )
-            .on_hover_text("trim inside the rack, after the per-pad levels");
-            widgets::knob_param(
-                ui,
-                &KnobSpec::new("Gain", 0.0..=1.5)
-                    .colour(palette::DRUM)
-                    .default(1.0)
-                    .size(36.0),
-                &p.drum_gain,
-            )
-            .on_hover_text("level of the drum bus in the mix, under the master");
         });
     });
 }

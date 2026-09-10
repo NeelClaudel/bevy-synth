@@ -1,10 +1,10 @@
-//! The transport strip: play, tempo, clock source and the output meters.
+//! The transport strip: play, tempo and clock source.
 
-use egui::{Ui, Vec2};
+use egui::Ui;
 use bevy_synth::{Synth, SynthTelemetry};
 use synth_core::params::ClockSource;
 
-use crate::widgets::{self, palette, KnobSpec};
+use crate::widgets::{self, palette};
 use crate::{SynthUi, dropdown};
 
 pub(crate) fn transport(ui: &mut Ui, synth: &Synth, telemetry: &SynthTelemetry, state: &mut SynthUi) {
@@ -91,50 +91,6 @@ pub(crate) fn transport(ui: &mut Ui, synth: &Synth, telemetry: &SynthTelemetry, 
                         .size(10.0),
                 );
             }
-        });
-
-        ui.horizontal(|ui| {
-            widgets::knob_param(
-                ui,
-                &KnobSpec::new("Master", 0.0..=1.5)
-                    .colour(palette::ACCENT)
-                    .default(0.5)
-                    .size(36.0),
-                &synth.params.master_gain,
-            )
-            .on_hover_text("level of the whole mix, synth and drums together");
-            widgets::knob_param(
-                ui,
-                &KnobSpec::new("Synth", 0.0..=1.5)
-                    .colour(palette::ACCENT)
-                    .default(1.0)
-                    .size(36.0),
-                &synth.params.synth_gain,
-            )
-            .on_hover_text("level of the melody bus alone, under the master");
-            widgets::knob_param(
-                ui,
-                &KnobSpec::new("Drive", 0.5..=10.0)
-                    .log()
-                    .colour(palette::ACCENT)
-                    .default(1.0)
-                    .size(36.0),
-                &synth.params.drive,
-            );
-            ui.vertical(|ui| {
-                ui.add_space(12.0);
-                ui.label(
-                    egui::RichText::new("output")
-                        .color(palette::TEXT_DIM)
-                        .size(9.0),
-                );
-                widgets::level_meter(
-                    ui,
-                    Vec2::new(220.0, 12.0),
-                    telemetry.peak,
-                    &mut state.meter_hold,
-                );
-            });
         });
     });
 }

@@ -875,31 +875,69 @@ pub fn piano(
 }
 
 /// A labelled section frame, so the panel groups into recognisable blocks.
+///
+/// Sections fold away when the header is clicked. The full panel is taller
+/// than a laptop screen and no patch uses all of it at once, so being able to
+/// put the reverb out of sight while dialling in an envelope is worth more
+/// than seeing every control at all times.
+///
+/// The open flag lives in egui's own memory, keyed by title, rather than in
+/// [`crate::SynthUi`]: it is a view preference, it has to survive across
+/// frames, and threading a bool per section through the panel state would mean
+/// touching every section signature to say something none of them care about.
+///
+/// Returns `None` when the section is closed and `contents` therefore did not
+/// run.
 pub fn section<R>(
     ui: &mut Ui,
     title: &str,
     colour: Color32,
     contents: impl FnOnce(&mut Ui) -> R,
-) -> R {
+) -> Option<R> {
+    let id = ui.make_persistent_id(("synth_section", title));
+    let mut state =
+        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true);
+
     egui::Frame::new()
         .fill(palette::SECTION)
         .corner_radius(5.0)
         .inner_margin(egui::Margin::symmetric(8, 6))
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                // A colour tab per section: the eye finds "the orange block" far
-                // faster than it reads the word "Filter".
-                let (tab, _) = ui.allocate_exact_size(Vec2::new(3.0, 12.0), Sense::hover());
-                ui.painter().rect_filled(tab, 1.5, colour);
-                ui.label(
-                    egui::RichText::new(title)
-                        .color(palette::TEXT)
-                        .size(11.0)
-                        .strong(),
-                );
-            });
-            ui.add_space(4.0);
-            contents(ui)
+            let header = ui
+                .horizontal(|ui| {
+                    // A colour tab per section: the eye finds "the orange block" far
+                    // faster than it reads the word "Filter".
+                    let (tab, _) = ui.allocate_exact_size(Vec2::new(3.0, 12.0), Sense::hover());
+                    ui.painter().rect_filled(tab, 1.5, colour);
+                    ui.label(
+                        egui::RichText::new(title)
+                            .color(palette::TEXT)
+                            .size(11.0)
+                            .strong(),
+                    );
+                    ui.label(
+                        egui::RichText::new(if state.is_open() { "\u{25be}" } else { "\u{25b8}" })
+                            .color(palette::TEXT_DIM)
+                            .size(9.0),
+                    );
+                })
+                .response
+                .interact(Sense::click());
+
+            if header.clicked() {
+                state.toggle(ui);
+            }
+            if header.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+
+            // Tracks the fold, so closing a section does not leave a gap behind
+            // where its contents used to be.
+            ui.add_space(4.0 * state.openness(ui.ctx()));
+
+            state
+                .show_body_unindented(ui, contents)
+                .map(|body| body.inner)
         })
         .inner
 }
