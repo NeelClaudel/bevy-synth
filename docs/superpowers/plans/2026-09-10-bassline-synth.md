@@ -491,7 +491,7 @@ Add to `mod tests` in `crates/synth_core/src/sequencer.rs`:
     fn gen_with(slide_chance: f32, accent_chance: f32) -> GenerativeSettings {
         GenerativeSettings {
             root: 0,
-            scale: Scale::Minor,
+            scale: Scale::NaturalMinor,
             octave: 3,
             range: 2,
             density: 0.9,
