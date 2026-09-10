@@ -2421,6 +2421,65 @@ mod tests {
     }
 
     #[test]
+    fn comp_bass_ducks_on_the_kick_and_not_on_other_pads() {
+        // The tap the drum rack already publishes, reused: bass ducking under
+        // the kick falls out with no new machinery, and this is the test that
+        // says so.
+        let ducking = Params {
+            bass_enabled: true,
+            drum_enabled: true,
+            seq_playing: true,
+            comp_bass: CompressorParams {
+                on: true,
+                threshold_db: -30.0,
+                ratio: 10.0,
+                sidechain: SidechainSource::Kick,
+                ..CompressorParams::default()
+            },
+            ..Params::default()
+        };
+        let shared = std::sync::Arc::new(SharedParams::from_params(&ducking));
+        let (tx, rx) = channel(256);
+        let mut engine = Engine::new(48_000.0, shared.clone(), rx);
+
+        // Pad 0 is the kick: `rack.rs` writes `out.kick` from pad 0, and
+        // `sidechain(SidechainSource::Kick, ..)` copies that tap. `Cell` is
+        // already imported into this `mod tests` as `crate::drums::Cell`.
+        for step in (0..16u8).step_by(4) {
+            assert!(tx.push(Event::SetDrumCell {
+                step,
+                pad: 0,
+                cell: Cell { active: true, velocity: 1.0 },
+            }));
+        }
+        engine_peak(&mut engine, 1_200);
+        let with_kick = shared.comp_bass_gr.get();
+
+        // Now the same pattern on a pad that is not the kick. Pad 2 is a hat
+        // in the default rack; any pad but 0 proves the point.
+        for step in (0..16u8).step_by(4) {
+            assert!(tx.push(Event::SetDrumCell {
+                step,
+                pad: 0,
+                cell: Cell::default(),
+            }));
+            assert!(tx.push(Event::SetDrumCell {
+                step,
+                pad: 2,
+                cell: Cell { active: true, velocity: 1.0 },
+            }));
+        }
+        engine_peak(&mut engine, 1_200);
+        let without_kick = shared.comp_bass_gr.get();
+
+        assert!(
+            with_kick > without_kick + 0.5,
+            "the kick should duck the bass and another pad should not: \
+             {with_kick} vs {without_kick}"
+        );
+    }
+
+    #[test]
     fn the_bass_bus_skips_the_drive_stage() {
         // Drive belongs to the synth. Turning it up must not change the bass,
         // exactly as it does not change the drums.
