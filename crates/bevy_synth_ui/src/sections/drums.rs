@@ -45,15 +45,6 @@ pub(crate) fn drums(ui: &mut Ui, synth: &Synth, telemetry: &SynthTelemetry, stat
                 p.drum_enabled.set(enabled);
             }
 
-            let mut to_fx = p.drum_to_fx.get();
-            if ui
-                .checkbox(&mut to_fx, "Through FX")
-                .on_hover_text("send the drum bus through delay and reverb instead of past them")
-                .changed()
-            {
-                p.drum_to_fx.set(to_fx);
-            }
-
             ui.label(
                 egui::RichText::new("Length")
                     .color(palette::TEXT_DIM)

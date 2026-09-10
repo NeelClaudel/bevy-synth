@@ -497,8 +497,6 @@ pub struct Params {
     /// under a four-bar melody is a groove, not a mistake.
     pub drum_length: usize,
     pub drum_level: f32,
-    /// Sends the drum bus through delay and reverb.
-    pub drum_to_fx: bool,
     /// How much of the drum send pair reaches the return bus.
     pub drum_send: f32,
     /// Per-pad position in the stereo field, -1.0 hard left to 1.0 hard right.
@@ -625,7 +623,6 @@ impl Default for Params {
             melody_enabled: true,
             drum_length: 16,
             drum_level: 0.8,
-            drum_to_fx: false,
             drum_send: 0.0,
             pad_pan: [0.0; PAD_COUNT],
             pad_send: [1.0; PAD_COUNT],
@@ -755,7 +752,6 @@ pub struct SharedParams {
     pub melody_enabled: AtomicBool32,
     pub drum_length: AtomicEnum,
     pub drum_level: AtomicF32,
-    pub drum_to_fx: AtomicBool32,
     pub drum_send: AtomicF32,
     pub pad_pan: [AtomicF32; PAD_COUNT],
     pub pad_send: [AtomicF32; PAD_COUNT],
@@ -924,7 +920,6 @@ impl SharedParams {
             melody_enabled: AtomicBool32::new(p.melody_enabled),
             drum_length: AtomicEnum::new(p.drum_length as u32),
             drum_level: AtomicF32::new(p.drum_level),
-            drum_to_fx: AtomicBool32::new(p.drum_to_fx),
             drum_send: AtomicF32::new(p.drum_send),
             pad_pan: core::array::from_fn(|i| AtomicF32::new(p.pad_pan[i])),
             pad_send: core::array::from_fn(|i| AtomicF32::new(p.pad_send[i])),
@@ -1053,7 +1048,6 @@ impl SharedParams {
             melody_enabled: self.melody_enabled.get(),
             drum_length: (self.drum_length.get() as usize).clamp(1, crate::sequencer::MAX_STEPS),
             drum_level: clamp01(self.drum_level.get()),
-            drum_to_fx: self.drum_to_fx.get(),
             drum_send: clamp01(self.drum_send.get()),
             pad_pan: core::array::from_fn(|i| sane(self.pad_pan[i].get(), 0.0).clamp(-1.0, 1.0)),
             pad_send: core::array::from_fn(|i| clamp01(self.pad_send[i].get())),
@@ -1159,7 +1153,6 @@ impl SharedParams {
         self.melody_enabled.set(p.melody_enabled);
         self.drum_length.set(p.drum_length as u32);
         self.drum_level.set(p.drum_level);
-        self.drum_to_fx.set(p.drum_to_fx);
         self.drum_send.set(p.drum_send);
         for i in 0..PAD_COUNT {
             self.pad_pan[i].set(p.pad_pan[i]);

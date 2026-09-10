@@ -14,11 +14,11 @@
 use std::sync::Arc;
 
 use crate::clock::Clock;
-use crate::drums::{Column, DrumPattern, DrumRack};
+use crate::drums::{Column, DrumBuses, DrumPattern, DrumRack};
 use crate::event::{Consumer, Event};
-use crate::fx::FxChain;
+use crate::fx::{Compressor, FxChain};
 use crate::lfo::Lfo;
-use crate::params::{ClockSource, Params, SharedParams, Smoothed, VoiceMode};
+use crate::params::{ClockSource, Params, SharedParams, SidechainSource, Smoothed, VoiceMode};
 use crate::sequencer::{GenerativeSettings, Sequencer, MAX_STEPS};
 use crate::voice::Voice;
 use crate::BLOCK;
@@ -72,6 +72,11 @@ pub struct Engine {
 
     /// The effects stage: stereo delay into plate reverb.
     fx: FxChain,
+
+    /// Bus inserts. The synth one sits before the send tap so the return
+    /// hears the compressed signal; the master one is glue on the sum.
+    comp_synth: Compressor,
+    comp_master: Compressor,
 
     /// Eight drum pads and their own grid sequencer, running off the same
     /// clock as the melody.
@@ -130,6 +135,8 @@ impl Engine {
             // the bottom of the audible range.
             dc_coef: 1.0 - (2.0 * core::f32::consts::PI * 10.0 / sample_rate),
             fx: FxChain::new(sample_rate),
+            comp_synth: Compressor::new(sample_rate),
+            comp_master: Compressor::new(sample_rate),
             // The seed is arbitrary but fixed: the noise pads must sound the
             // same on every run, or the golden vector would be untestable the
             // moment drums are switched on.
@@ -172,6 +179,8 @@ impl Engine {
             gain.set_time(15.0, sample_rate / BLOCK as f32);
         }
         self.fx.set_sample_rate(sample_rate);
+        self.comp_synth.set_sample_rate(sample_rate);
+        self.comp_master.set_sample_rate(sample_rate);
         self.drums.set_sample_rate(sample_rate);
     }
 
@@ -342,30 +351,58 @@ impl Engine {
             right[i] = levelled;
         }
 
-        // Drums into the effects only if asked. They are summed after the
-        // drive stage and the DC blocker either way: a kick through the soft
-        // clipper at drive 3.0 is a different instrument, and not a better one.
-        if drums_playing && params.drum_to_fx {
+        // Insert, before the send tap: the return hears the compressed
+        // signal, which is what makes a pumped synth pump in the reverb too.
+        let mut detector = [0.0f32; BLOCK];
+        let source = params.comp_synth.sidechain;
+        let key = sidechain(source, self.drums.buses(), &mut detector, count);
+        self.comp_synth
+            .process(&mut left[..count], &mut right[..count], key, &params.comp_synth);
+
+        // The sends. The synth is tapped post-compressor; the drums bring
+        // their own per-pad send pair, scaled by the bus knob.
+        let mut send_l = [0.0f32; BLOCK];
+        let mut send_r = [0.0f32; BLOCK];
+        for i in 0..count {
+            send_l[i] = left[i] * params.synth_send;
+            send_r[i] = right[i] * params.synth_send;
+        }
+
+        // Drums are summed after the drive stage and the DC blocker: a kick
+        // through the soft clipper at drive 3.0 is a different instrument,
+        // and not a better one.
+        if drums_playing {
             let bus = self.drums.buses();
+            let send = drum_gain * params.drum_send;
             for i in 0..count {
                 left[i] += bus.dry_l[i] * drum_gain;
                 right[i] += bus.dry_r[i] * drum_gain;
+                send_l[i] += bus.send_l[i] * send;
+                send_r[i] += bus.send_r[i] * send;
             }
         }
 
         // The clock, not `params.tempo`: when an external MIDI clock is
         // driving the sequencer, that is the tempo the delay must lock to.
         let tempo = self.clock.tempo_bpm(params.steps_per_beat);
-        self.fx
-            .process_block(&mut left[..count], &mut right[..count], params, tempo);
 
-        if drums_playing && !params.drum_to_fx {
-            let bus = self.drums.buses();
-            for i in 0..count {
-                left[i] += bus.dry_l[i] * drum_gain;
-                right[i] += bus.dry_r[i] * drum_gain;
-            }
+        // The return. `FxChain` is an insert, so it hands back dry + wet;
+        // subtracting the send leaves the wet, and at zero mix that is
+        // exactly `0.0` rather than approximately.
+        let mut ret_l = send_l;
+        let mut ret_r = send_r;
+        self.fx
+            .process_block(&mut ret_l[..count], &mut ret_r[..count], params, tempo);
+        for i in 0..count {
+            left[i] += ret_l[i] - send_l[i];
+            right[i] += ret_r[i] - send_r[i];
         }
+
+        // Glue on the sum.
+        let source = params.comp_master.sidechain;
+        let key = sidechain(source, self.drums.buses(), &mut detector, count);
+        self.comp_master
+            .process(&mut left[..count], &mut right[..count], key, &params.comp_master);
 
         for i in 0..count {
             let l = left[i] * gain;
@@ -781,6 +818,34 @@ pub fn soft_clip(x: f32) -> f32 {
     }
 }
 
+/// Fills `scratch` with the detector signal and hands back a view of it, or
+/// `None` when the compressor should detect on its own input.
+///
+/// The tap is ahead of the drum fader, so pulling the rack to silence leaves
+/// a trigger track that ducks without being heard — the usual way to key a
+/// compressor off a kick. A rack that is switched off or has stopped ringing
+/// zeroes these buses itself, so an idle rack cannot pump anything.
+fn sidechain<'a>(
+    source: SidechainSource,
+    bus: &DrumBuses,
+    scratch: &'a mut [f32; BLOCK],
+    count: usize,
+) -> Option<&'a [f32]> {
+    match source {
+        SidechainSource::Off => None,
+        SidechainSource::DrumBus => {
+            for (i, sample) in scratch.iter_mut().enumerate().take(count) {
+                *sample = (bus.dry_l[i] + bus.dry_r[i]) * 0.5;
+            }
+            Some(&scratch[..count])
+        }
+        SidechainSource::Kick => {
+            scratch[..count].copy_from_slice(&bus.kick[..count]);
+            Some(&scratch[..count])
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -855,42 +920,6 @@ mod tests {
             peak(&render(&mut engine, 8_192)) > 0.01,
             "the drum bus never arrived"
         );
-    }
-
-    /// The routing switch, stated as a test. With `drum_to_fx` off the drum is
-    /// summed *after* the effects, so cranking the reverb to fully wet must not
-    /// touch it — the melody is silent, so the reverb has nothing else to work
-    /// on, and a soaking-wet run has to come out bit-identical to a dry one.
-    /// Flip the switch and the same pattern has to change, or the flag routes
-    /// nothing.
-    #[test]
-    fn a_dry_routed_drum_arrives_unreverberated() {
-        fn kick(to_fx: bool, reverb_mix: f32) -> Vec<f32> {
-            let (mut engine, tx, params) = engine();
-            params.drum_enabled.set(true);
-            params.seq_playing.set(true);
-            params.melody_enabled.set(false);
-            params.drum_to_fx.set(to_fx);
-            params.reverb_mix.set(reverb_mix);
-            assert!(tx.push(Event::SetDrumCell {
-                step: 0,
-                pad: 0,
-                cell: Cell {
-                    active: true,
-                    velocity: 1.0
-                },
-            }));
-            render(&mut engine, 8_192)
-        }
-
-        let dry = kick(false, 0.0);
-        assert!(peak(&dry) > 0.01, "the drum bus never arrived");
-        assert_eq!(
-            kick(false, 1.0),
-            dry,
-            "a bypassed drum picked up reverb anyway"
-        );
-        assert_ne!(kick(true, 1.0), dry, "drum_to_fx routed nothing");
     }
 
     /// The mirror is what the UI draws from, so an edit has to show up in it.
@@ -1568,25 +1597,26 @@ mod tests {
         );
     }
 
-    /// Both sum sites, not just one: the bus is mixed before the effects when
-    /// `drum_to_fx` is on and after them when it is off, and a gain applied to
-    /// only one branch would leave the rack audible on the other.
+    /// Both sum sites, not just one: the rack reaches the master through its
+    /// dry pair and the return bus through its send pair, and a gain applied
+    /// to only one of them would leave the rack audible on the other.
     #[test]
-    fn a_zeroed_drum_gain_silences_the_drums_on_either_routing() {
-        for to_fx in [false, true] {
+    fn a_zeroed_drum_gain_silences_the_drums() {
+        for send in [0.0, 1.0] {
             let (mut engine, tx) = engine_preset(|p| {
                 p.drum_gain.set(0.0);
                 p.drum_enabled.set(true);
                 p.seq_playing.set(true);
                 p.melody_enabled.set(false);
-                p.drum_to_fx.set(to_fx);
+                p.drum_send.set(send);
+                p.delay_mix.set(1.0);
             });
             kick_on_one(&tx);
 
             assert_eq!(
                 peak(&render(&mut engine, 8_192)),
                 0.0,
-                "the rack played through a closed drum gain (drum_to_fx = {to_fx})"
+                "the rack played through a closed drum gain (drum_send = {send})"
             );
         }
     }
@@ -1606,4 +1636,224 @@ mod tests {
         );
     }
 
+    /// The claim the golden vector rests on: with both mixes at zero the
+    /// return hands back exactly what it was sent, so `chain(send) - send`
+    /// is `0.0` and the send knob is inaudible. Bit-identical, not close.
+    #[test]
+    fn the_return_adds_nothing_at_zero_mix() {
+        let (mut full, tx_full) = engine_preset(|p| {
+            p.seq_playing.set(false);
+            p.synth_send.set(1.0);
+        });
+        let (mut none, tx_none) = engine_preset(|p| {
+            p.seq_playing.set(false);
+            p.synth_send.set(0.0);
+        });
+        for tx in [&tx_full, &tx_none] {
+            tx.push(Event::NoteOn {
+                note: 60,
+                velocity: 0.8,
+            });
+        }
+
+        assert_eq!(render(&mut full, 4096), render(&mut none, 4096));
+    }
+
+    /// The send/return has to reproduce the insert it replaced. The reference
+    /// is an `FxChain` of its own, fed the engine's dry output in the same
+    /// 32-frame chunks the engine uses: that *is* the old code path.
+    #[test]
+    fn a_full_send_reproduces_the_insert_it_replaced() {
+        // The dry signal. At zero mix the return contributes nothing, so
+        // this is the engine's dry path with the master fader wide open.
+        let (mut dry_engine, tx_dry) = engine_preset(|p| {
+            p.seq_playing.set(false);
+            p.master_gain.set(1.0);
+        });
+        tx_dry.push(Event::NoteOn {
+            note: 60,
+            velocity: 0.8,
+        });
+        let dry = render(&mut dry_engine, 4096);
+
+        // The same signal through a fresh chain, as an insert.
+        let mut l: Vec<f32> = dry.iter().step_by(2).copied().collect();
+        let mut r: Vec<f32> = dry.iter().skip(1).step_by(2).copied().collect();
+        let mut chain = crate::fx::FxChain::new(48_000.0);
+        let mut reference_params = Params::default();
+        reference_params.delay_mix = 0.5;
+        for (cl, cr) in l.chunks_mut(BLOCK).zip(r.chunks_mut(BLOCK)) {
+            chain.process_block(cl, cr, &reference_params, reference_params.tempo);
+        }
+
+        // And the same signal through the engine, sent to the return at 1.0.
+        let (mut wet_engine, tx_wet) = engine_preset(|p| {
+            p.seq_playing.set(false);
+            p.master_gain.set(1.0);
+            p.synth_send.set(1.0);
+            p.delay_mix.set(0.5);
+        });
+        tx_wet.push(Event::NoteOn {
+            note: 60,
+            velocity: 0.8,
+        });
+        let wet = render(&mut wet_engine, 4096);
+
+        // Sanity: the delay actually did something, or this proves nothing.
+        assert!(peak(&wet) > 0.0);
+        assert_ne!(wet, dry, "the delay was inaudible; the test is vacuous");
+
+        for (i, sample) in wet.iter().enumerate() {
+            let want = if i % 2 == 0 { l[i / 2] } else { r[i / 2] };
+            assert!(
+                (sample - want).abs() < 1.0e-6,
+                "sample {i}: return {sample} vs insert {want}"
+            );
+        }
+    }
+
+    /// `drum_send` replaces the old bool's `false` position: at 0.0 the rack
+    /// puts nothing into the return, so raising a mix changes nothing.
+    #[test]
+    fn a_closed_drum_send_keeps_the_rack_out_of_the_return() {
+        let (mut wet, tx_wet) = engine_preset(|p| {
+            p.melody_enabled.set(false);
+            p.drum_enabled.set(true);
+            p.drum_send.set(0.0);
+            p.delay_mix.set(1.0);
+        });
+        let (mut dry, tx_dry) = engine_preset(|p| {
+            p.melody_enabled.set(false);
+            p.drum_enabled.set(true);
+            p.drum_send.set(0.0);
+            p.delay_mix.set(0.0);
+        });
+        for tx in [&tx_wet, &tx_dry] {
+            kick_on_one(tx);
+            tx.push(Event::ClockStart);
+        }
+
+        let wet_out = render(&mut wet, 8192);
+        assert!(peak(&wet_out) > 0.0, "the rack never sounded");
+        assert_eq!(wet_out, render(&mut dry, 8192));
+    }
+
+    /// The other position of the old bool: opened up, the rack reaches the
+    /// effects. The algebra that makes this equal the old insert is the same
+    /// code `a_full_send_reproduces_the_insert_it_replaced` pins; what is
+    /// specific here is that the rack's send pair is wired to it at all.
+    #[test]
+    fn an_open_drum_send_reaches_the_effects() {
+        let (mut open, tx_open) = engine_preset(|p| {
+            p.melody_enabled.set(false);
+            p.drum_enabled.set(true);
+            p.drum_send.set(1.0);
+            p.delay_mix.set(1.0);
+        });
+        let (mut shut, tx_shut) = engine_preset(|p| {
+            p.melody_enabled.set(false);
+            p.drum_enabled.set(true);
+            p.drum_send.set(0.0);
+            p.delay_mix.set(1.0);
+        });
+        for tx in [&tx_open, &tx_shut] {
+            kick_on_one(tx);
+            tx.push(Event::ClockStart);
+        }
+
+        assert_ne!(render(&mut open, 8192), render(&mut shut, 8192));
+    }
+
+    /// Per-pad sends are why the rack renders a send pair instead of the
+    /// engine scaling the dry one. Pad 0 muted out of the send has to leave
+    /// the return empty even with the bus send wide open.
+    #[test]
+    fn a_pad_send_of_zero_survives_to_the_return() {
+        let (mut sent, tx_sent) = engine_preset(|p| {
+            p.melody_enabled.set(false);
+            p.drum_enabled.set(true);
+            p.drum_send.set(1.0);
+            p.delay_mix.set(1.0);
+            p.pad_send[0].set(1.0);
+        });
+        let (mut held_back, tx_held) = engine_preset(|p| {
+            p.melody_enabled.set(false);
+            p.drum_enabled.set(true);
+            p.drum_send.set(1.0);
+            p.delay_mix.set(1.0);
+            p.pad_send[0].set(0.0);
+        });
+        for tx in [&tx_sent, &tx_held] {
+            kick_on_one(tx);
+            tx.push(Event::ClockStart);
+        }
+
+        assert_ne!(render(&mut sent, 8192), render(&mut held_back, 8192));
+    }
+
+    /// A compressor whose detector never crosses the threshold computes
+    /// `10^((0 - 0)/20)` — exactly 1.0 — and multiplying by 1.0 is bit-exact.
+    /// So an armed sidechain over a silent rack has to be *identical*, not
+    /// merely close: anything else means the detector is picking up the synth.
+    #[test]
+    fn an_armed_sidechain_over_a_silent_rack_changes_nothing() {
+        let (mut armed, tx_armed) = engine_preset(|p| {
+            p.seq_playing.set(false);
+            p.drum_enabled.set(true);
+            p.comp_synth.on.set(true);
+            p.comp_synth.sidechain.set(SidechainSource::Kick as u32);
+        });
+        let (mut bypassed, tx_bypassed) = engine_preset(|p| {
+            p.seq_playing.set(false);
+            p.drum_enabled.set(true);
+        });
+        for tx in [&tx_armed, &tx_bypassed] {
+            tx.push(Event::NoteOn {
+                note: 60,
+                velocity: 0.8,
+            });
+            tx.push(Event::ClockStart);
+        }
+
+        assert_eq!(render(&mut armed, 4096), render(&mut bypassed, 4096));
+    }
+
+    /// The point of the whole feature: pad 0 ducks the synth. Both engines
+    /// hold the same note with the same compressor armed; only one has a
+    /// kick programmed, and the ducked one has to come out quieter.
+    #[test]
+    fn the_kick_ducks_the_synth_through_the_sidechain() {
+        let arm = |p: &SharedParams| {
+            p.seq_playing.set(false);
+            p.drum_enabled.set(true);
+            p.drum_gain.set(0.0); // Hear the ducking, not the kick.
+            p.comp_synth.on.set(true);
+            p.comp_synth.sidechain.set(SidechainSource::Kick as u32);
+            p.comp_synth.threshold_db.set(-30.0);
+            p.comp_synth.ratio.set(10.0);
+            p.comp_synth.attack_ms.set(1.0);
+            p.comp_synth.release_ms.set(200.0);
+        };
+        let (mut ducked, tx_ducked) = engine_preset(arm);
+        let (mut steady, tx_steady) = engine_preset(arm);
+        for tx in [&tx_ducked, &tx_steady] {
+            tx.push(Event::NoteOn {
+                note: 60,
+                velocity: 0.8,
+            });
+        }
+        kick_on_one(&tx_ducked);
+        tx_ducked.push(Event::ClockStart);
+        tx_steady.push(Event::ClockStart);
+
+        let ducked_out = render(&mut ducked, 8192);
+        let steady_out = render(&mut steady, 8192);
+        assert!(peak(&steady_out) > 0.0, "the synth never sounded");
+        assert!(
+            peak(&ducked_out) < peak(&steady_out) * 0.9,
+            "the kick did not duck the synth: {} vs {}",
+            peak(&ducked_out),
+            peak(&steady_out)
+        );
+    }
 }
