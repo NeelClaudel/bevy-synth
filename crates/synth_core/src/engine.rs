@@ -18,6 +18,7 @@ use crate::drums::{Column, DrumBuses, DrumPattern, DrumRack};
 use crate::event::{Consumer, Event};
 use crate::fx::{Compressor, FxChain};
 use crate::lfo::Lfo;
+use crate::bass::BassVoice;
 use crate::params::{ClockSource, Params, SharedParams, SidechainSource, Smoothed, VoiceMode};
 use crate::sequencer::{GenerativeSettings, SeqSettings, Sequencer, MAX_STEPS};
 use crate::voice::Voice;
@@ -85,6 +86,16 @@ pub struct Engine {
     /// Scratch buffer for one block of voice output.
     block: Vec<f32>,
 
+    /// The bass line. A second sequencer rather than a second channel on the
+    /// first: two independent patterns are the point, and they cost one
+    /// struct.
+    bass_seq: Sequencer,
+    bass: BassVoice,
+    comp_bass: Compressor,
+    bass_gain: Smoothed,
+    /// Scratch for the bass's mono render, before it is duplicated to a pair.
+    bass_block: Vec<f32>,
+
     last_voice_mode: VoiceMode,
     last_melody_enabled: bool,
     last_regenerate: u32,
@@ -116,6 +127,11 @@ impl Engine {
         );
         sequencer.regenerate(&GenerativeSettings::from_params(&snapshot));
 
+        let mut bass_seq = Sequencer::new(
+            params.bass_gen_seed.load(core::sync::atomic::Ordering::Relaxed),
+        );
+        bass_seq.regenerate(&GenerativeSettings::for_bass(&snapshot));
+
         let mut engine = Self {
             sample_rate,
             params,
@@ -142,6 +158,11 @@ impl Engine {
             // moment drums are switched on.
             drums: DrumRack::new(sample_rate, 0xD61B_5EED),
             block: vec![0.0; BLOCK],
+            bass_seq,
+            bass: BassVoice::new(sample_rate, 0xB455_5EED),
+            comp_bass: Compressor::new(sample_rate),
+            bass_gain: Smoothed::new(snapshot.bass_gain, 15.0, control_rate),
+            bass_block: vec![0.0; BLOCK],
             last_voice_mode: snapshot.voice_mode,
             last_melody_enabled: snapshot.melody_enabled,
             last_regenerate: 0,
@@ -150,6 +171,7 @@ impl Engine {
         };
         engine.clock.set_tempo(snapshot.tempo, snapshot.steps_per_beat);
         engine.publish_pattern();
+        engine.publish_bass_pattern();
         engine
     }
 
@@ -272,6 +294,7 @@ impl Engine {
         self.master_gain.set_target(params.master_gain);
         self.synth_gain.set_target(params.synth_gain);
         self.drum_gain.set_target(params.drum_gain);
+        self.bass_gain.set_target(params.bass_gain);
 
         params
     }
@@ -308,6 +331,28 @@ impl Engine {
             }
             if let Some((note, velocity)) = seq.note_on {
                 self.note_on(note, velocity, params);
+            }
+        }
+
+        // The same `adv` and `view` the lead just used. One clock advance
+        // drives all three sequencers, so nothing can drift from anything
+        // else by construction.
+        let bass_seq = self
+            .bass_seq
+            .advance(count, adv, view, &SeqSettings::for_bass(params));
+        if self.bass_seq.take_pattern_changed() {
+            self.params.bass_seq_length.set(self.bass_seq.pattern().len() as u32);
+            self.publish_bass_pattern();
+        }
+        if params.bass_enabled {
+            // Note-off first, then note-on: a tie relies on the voice still
+            // being active when the new note arrives, and `BassVoice::note_on`
+            // re-gates anyway.
+            if bass_seq.note_off.is_some() && !bass_seq.slide {
+                self.bass.note_off();
+            }
+            if let Some((note, _velocity)) = bass_seq.note_on {
+                self.bass.note_on(note, bass_seq.accent, bass_seq.slide);
             }
         }
 
@@ -371,6 +416,51 @@ impl Engine {
         for i in 0..count {
             send_l[i] = left[i] * params.synth_send;
             send_r[i] = right[i] * params.synth_send;
+        }
+
+        // The bass bus. Not through `drive`, the soft clipper or the DC
+        // blocker: those are the synth's, and the same argument the kick makes
+        // above applies here — the 303's dirt comes from resonance and
+        // envelope depth, not from saturation.
+        if params.bass_enabled {
+            let bass_gain = self.bass_gain.next();
+            let block = &mut self.bass_block[..count];
+            self.bass.process_block(block, &params.bass);
+
+            // Mono, duplicated. A bass is centred; there is no pan control and
+            // no reason for one.
+            let mut bass_l = [0.0f32; BLOCK];
+            let mut bass_r = [0.0f32; BLOCK];
+            for i in 0..count {
+                let value = self.bass_block[i] * bass_gain;
+                let value = if value.is_finite() { value } else { 0.0 };
+                bass_l[i] = value;
+                bass_r[i] = value;
+            }
+
+            // Insert, before the send tap, matching `comp_synth`: the return
+            // hears the compressed signal, so a bass ducking under the kick
+            // ducks in the reverb too.
+            let mut detector = [0.0f32; BLOCK];
+            let source = params.comp_bass.sidechain;
+            let key = sidechain(source, self.drums.buses(), &mut detector, count);
+            self.comp_bass.process(
+                &mut bass_l[..count],
+                &mut bass_r[..count],
+                key,
+                &params.comp_bass,
+            );
+
+            for i in 0..count {
+                left[i] += bass_l[i];
+                right[i] += bass_r[i];
+                send_l[i] += bass_l[i] * params.bass_send;
+                send_r[i] += bass_r[i] * params.bass_send;
+            }
+        } else {
+            // Keep the smoother tracking while the bus is muted, so switching
+            // the bass on does not start it with a stale ramp.
+            self.bass_gain.next();
         }
 
         // Drums are summed after the drive stage and the DC blocker: a kick
@@ -606,6 +696,15 @@ impl Engine {
         self.params.publish_len(self.sequencer.pattern().len());
     }
 
+    /// Copies the bass pattern into its mirror. Same contract as
+    /// [`Engine::publish_pattern`]: only when it changes, never every block.
+    fn publish_bass_pattern(&self) {
+        for (index, step) in self.bass_seq.pattern().iter().enumerate() {
+            self.params.publish_bass_step(index, step);
+        }
+        self.params.publish_bass_len(self.bass_seq.pattern().len());
+    }
+
     /// Copies the drum grid into the shared mirror. Same contract as
     /// [`Engine::publish_pattern`]: only when it changes, never every block.
     fn publish_drum_grid(&self) {
@@ -801,6 +900,9 @@ impl Engine {
         self.params
             .drum_position
             .store(self.drums.sequencer_ref().position() as u32, Relaxed);
+        self.params
+            .bass_step
+            .store(self.bass_seq.position() as u32, Relaxed);
 
         // Keep the highest peak the control side has not yet read, so a UI
         // meter polling slower than the audio callback still catches transients.
@@ -816,6 +918,7 @@ impl Engine {
         self.params
             .comp_master_gr
             .set(self.comp_master.gain_reduction_db());
+        self.params.comp_bass_gr.set(self.comp_bass.gain_reduction_db());
     }
 }
 
@@ -2153,5 +2256,147 @@ mod tests {
         engine.params.comp_master.on.set(false);
         render(&mut engine, 4_096);
         assert_eq!(engine.params.comp_master_gr.get(), 0.0);
+    }
+
+    /// Renders `blocks` blocks through the *stereo* path and reports the peak
+    /// absolute sample.
+    ///
+    /// `render_stereo` and `peak` are already in this `mod tests`; the stereo
+    /// entry point is the one that matters here, because the bass bus is a
+    /// pair and the mono `process` collapses it before anything can be seen.
+    fn engine_peak(engine: &mut Engine, blocks: usize) -> f32 {
+        let out = render_stereo(engine, blocks * BLOCK);
+        assert!(out.iter().all(|s| s.is_finite()), "the bus went non-finite");
+        peak(&out)
+    }
+
+    #[test]
+    fn the_bass_is_silent_until_it_is_enabled() {
+        let quiet = Params {
+            bass_enabled: false,
+            melody_enabled: false,
+            drum_enabled: false,
+            seq_playing: true,
+            ..Params::default()
+        };
+        let shared = std::sync::Arc::new(SharedParams::from_params(&quiet));
+        let (_tx, rx) = crate::event::channel(64);
+        let mut engine = Engine::new(48_000.0, shared.clone(), rx);
+        assert!(engine_peak(&mut engine, 400) < 1e-6, "the bass must stay off");
+
+        shared.bass_enabled.set(true);
+        assert!(engine_peak(&mut engine, 400) > 0.001, "and sound once switched on");
+    }
+
+    #[test]
+    fn bass_and_lead_step_from_the_same_clock() {
+        let p = Params { bass_enabled: true, seq_playing: true, ..Params::default() };
+        let shared = std::sync::Arc::new(SharedParams::from_params(&p));
+        let (_tx, rx) = crate::event::channel(64);
+        let mut engine = Engine::new(48_000.0, shared.clone(), rx);
+        // Same length on both lines: locked to one clock, they must agree on
+        // which step they are on, every block, forever.
+        shared.bass_seq_length.set(shared.seq_length.get());
+        for _ in 0..2_000 {
+            render_stereo(&mut engine, BLOCK);
+            assert_eq!(
+                shared.bass_step.load(core::sync::atomic::Ordering::Relaxed),
+                shared.current_step.load(core::sync::atomic::Ordering::Relaxed),
+                "two lines, one clock"
+            );
+        }
+    }
+
+    #[test]
+    fn bass_send_feeds_the_return_and_zero_does_not() {
+        // Reverb fully wet, everything else muted: whatever comes out is the
+        // send.
+        //
+        // Two separate engines, not one engine measured twice in sequence: the
+        // bass sequencer keeps advancing between measurements, so reusing one
+        // engine would compare two different slices of the generative pattern
+        // (different notes, different accents) rather than the same notes
+        // with and without a tail. Every other dry/wet comparison in this
+        // file (e.g. `an_open_drum_send_reaches_the_effects`) already builds
+        // a fresh engine per side for exactly this reason.
+        //
+        // `bass_gain` is turned down from its 1.0 default: the 303 voice's
+        // resonant filter (resonance 0.7, env_mod 3.0) overshoots unity by
+        // up to ~2x on accented notes, so at default gain the dry signal
+        // alone already pins the engine's hard output clamp. Once both
+        // sides are clamped to the same ceiling, adding a send tail can't
+        // raise the measured peak and the comparison stops meaning
+        // anything. 0.4 keeps the dry peak comfortably under the clamp so
+        // the wet tail actually shows up in the measurement.
+        let base = Params {
+            bass_enabled: true,
+            melody_enabled: false,
+            drum_enabled: false,
+            seq_playing: true,
+            reverb_mix: 1.0,
+            bass_gain: 0.4,
+            ..Params::default()
+        };
+        let closed = Params { bass_send: 0.0, ..base };
+        let shared_closed = std::sync::Arc::new(SharedParams::from_params(&closed));
+        let (_tx_dry, rx_dry) = crate::event::channel(64);
+        let mut dry_engine = Engine::new(48_000.0, shared_closed, rx_dry);
+        let dry = engine_peak(&mut dry_engine, 800);
+
+        let open = Params { bass_send: 1.0, ..base };
+        let shared_open = std::sync::Arc::new(SharedParams::from_params(&open));
+        let (_tx_wet, rx_wet) = crate::event::channel(64);
+        let mut wet_engine = Engine::new(48_000.0, shared_open, rx_wet);
+        let wet = engine_peak(&mut wet_engine, 800);
+
+        assert!(wet > dry, "an open send should add a tail: {dry} -> {wet}");
+    }
+
+    #[test]
+    fn comp_bass_reports_the_reduction_it_applies() {
+        let p = Params {
+            bass_enabled: true,
+            seq_playing: true,
+            comp_bass: CompressorParams {
+                on: true,
+                threshold_db: -50.0,
+                ratio: 20.0,
+                ..CompressorParams::default()
+            },
+            ..Params::default()
+        };
+        let shared = std::sync::Arc::new(SharedParams::from_params(&p));
+        let (_tx, rx) = crate::event::channel(64);
+        let mut engine = Engine::new(48_000.0, shared.clone(), rx);
+        engine_peak(&mut engine, 600);
+        assert!(
+            shared.comp_bass_gr.get() > 0.5,
+            "a -50 dB threshold at 20:1 should show real gain reduction"
+        );
+    }
+
+    #[test]
+    fn the_bass_bus_skips_the_drive_stage() {
+        // Drive belongs to the synth. Turning it up must not change the bass,
+        // exactly as it does not change the drums.
+        let p = Params {
+            bass_enabled: true,
+            melody_enabled: false,
+            drum_enabled: false,
+            seq_playing: true,
+            drive: 1.0,
+            ..Params::default()
+        };
+        let shared = std::sync::Arc::new(SharedParams::from_params(&p));
+        let (_tx, rx) = crate::event::channel(64);
+        let mut engine = Engine::new(48_000.0, shared.clone(), rx);
+        let clean = engine_peak(&mut engine, 600);
+
+        shared.drive.set(8.0);
+        let driven = engine_peak(&mut engine, 600);
+        assert!(
+            (clean - driven).abs() < clean * 0.05,
+            "drive must not touch the bass: {clean} vs {driven}"
+        );
     }
 }
