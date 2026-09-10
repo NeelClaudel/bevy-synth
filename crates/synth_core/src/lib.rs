@@ -50,7 +50,7 @@ pub use fx::{FxChain, NoteDivision};
 pub use lfo::{Lfo, LfoTarget};
 pub use note::{midi_to_hz, Note};
 pub use osc::{Oscillator, Waveform};
-pub use params::{Params, SharedParams, Smoothed, VoiceMode};
+pub use params::{CompressorParams, Params, SharedParams, SidechainSource, Smoothed, VoiceMode};
 pub use rng::Rng;
 pub use scale::{Scale, ScaleQuantizer};
 pub use sequencer::{GenerativeSettings, Pattern, Sequencer, Step};

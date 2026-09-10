@@ -168,6 +168,120 @@ impl ClockSource {
     }
 }
 
+/// Where a compressor's detector listens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u32)]
+pub enum SidechainSource {
+    /// Detect on the signal being compressed.
+    #[default]
+    Off = 0,
+    /// Detect on the mono sum of the dry drum bus.
+    DrumBus = 1,
+    /// Detect on pad 0 alone.
+    Kick = 2,
+}
+
+impl SidechainSource {
+    pub const ALL: [SidechainSource; 3] = [
+        SidechainSource::Off,
+        SidechainSource::DrumBus,
+        SidechainSource::Kick,
+    ];
+    pub fn from_u32(v: u32) -> Self {
+        match v {
+            1 => SidechainSource::DrumBus,
+            2 => SidechainSource::Kick,
+            _ => SidechainSource::Off,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            SidechainSource::Off => "Off",
+            SidechainSource::DrumBus => "Drums",
+            SidechainSource::Kick => "Kick",
+        }
+    }
+}
+
+/// One compressor's settings.
+///
+/// Grouped rather than flattened into [`Params`] because there are two
+/// instances -- the synth bus insert and the master glue -- and grouping makes
+/// them identical by construction instead of two hand-copied blocks of seven
+/// fields.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CompressorParams {
+    pub on: bool,
+    pub threshold_db: f32,
+    pub ratio: f32,
+    pub attack_ms: f32,
+    pub release_ms: f32,
+    pub makeup_db: f32,
+    pub sidechain: SidechainSource,
+}
+
+impl Default for CompressorParams {
+    fn default() -> Self {
+        Self {
+            on: false,
+            threshold_db: -12.0,
+            ratio: 4.0,
+            attack_ms: 10.0,
+            release_ms: 100.0,
+            makeup_db: 0.0,
+            sidechain: SidechainSource::Off,
+        }
+    }
+}
+
+/// The atomic mirror of [`CompressorParams`].
+#[derive(Debug)]
+pub struct SharedCompressor {
+    pub on: AtomicBool32,
+    pub threshold_db: AtomicF32,
+    pub ratio: AtomicF32,
+    pub attack_ms: AtomicF32,
+    pub release_ms: AtomicF32,
+    pub makeup_db: AtomicF32,
+    pub sidechain: AtomicEnum,
+}
+
+impl SharedCompressor {
+    fn new(p: &CompressorParams) -> Self {
+        Self {
+            on: AtomicBool32::new(p.on),
+            threshold_db: AtomicF32::new(p.threshold_db),
+            ratio: AtomicF32::new(p.ratio),
+            attack_ms: AtomicF32::new(p.attack_ms),
+            release_ms: AtomicF32::new(p.release_ms),
+            makeup_db: AtomicF32::new(p.makeup_db),
+            sidechain: AtomicEnum::new(p.sidechain as u32),
+        }
+    }
+
+    fn snapshot(&self) -> CompressorParams {
+        CompressorParams {
+            on: self.on.get(),
+            threshold_db: sane(self.threshold_db.get(), -12.0).clamp(-60.0, 0.0),
+            ratio: sane(self.ratio.get(), 4.0).clamp(1.0, 20.0),
+            attack_ms: sane(self.attack_ms.get(), 10.0).clamp(0.1, 100.0),
+            release_ms: sane(self.release_ms.get(), 100.0).clamp(5.0, 1000.0),
+            makeup_db: sane(self.makeup_db.get(), 0.0).clamp(0.0, 24.0),
+            sidechain: SidechainSource::from_u32(self.sidechain.get()),
+        }
+    }
+
+    fn apply(&self, p: &CompressorParams) {
+        self.on.set(p.on);
+        self.threshold_db.set(p.threshold_db);
+        self.ratio.set(p.ratio);
+        self.attack_ms.set(p.attack_ms);
+        self.release_ms.set(p.release_ms);
+        self.makeup_db.set(p.makeup_db);
+        self.sidechain.set(p.sidechain as u32);
+    }
+}
+
 /// A one-pole smoother for a continuous parameter.
 ///
 /// Runs at control rate (once per [`crate::BLOCK`]), not per sample: at 48 kHz
@@ -318,6 +432,10 @@ pub struct Params {
     /// Level of the melody bus alone, applied after the soft clipper so it
     /// sets loudness without changing how hard `drive` is saturating.
     pub synth_gain: f32,
+    /// How much of the compressed synth bus reaches the return bus.
+    pub synth_send: f32,
+    pub comp_synth: CompressorParams,
+    pub comp_master: CompressorParams,
     /// Level of the drum bus alone, applied where the rack is summed into the
     /// mix. Independent of `drum_level`, which trims the rack internally.
     pub drum_gain: f32,
@@ -381,6 +499,12 @@ pub struct Params {
     pub drum_level: f32,
     /// Sends the drum bus through delay and reverb.
     pub drum_to_fx: bool,
+    /// How much of the drum send pair reaches the return bus.
+    pub drum_send: f32,
+    /// Per-pad position in the stereo field, -1.0 hard left to 1.0 hard right.
+    pub pad_pan: [f32; PAD_COUNT],
+    /// Per-pad contribution to the drum send pair, before `drum_send`.
+    pub pad_send: [f32; PAD_COUNT],
     /// Per-pad mix level.
     pub pad_level: [f32; PAD_COUNT],
     /// Per-pad tuning in semitones from the pad's base frequency.
@@ -469,6 +593,9 @@ impl Default for Params {
             // sound, not a change to it, so a patch that never touches them
             // renders exactly as it did before they existed.
             synth_gain: 1.0,
+            synth_send: 1.0,
+            comp_synth: CompressorParams::default(),
+            comp_master: CompressorParams::default(),
             drum_gain: 1.0,
             drive: 1.0,
 
@@ -499,6 +626,9 @@ impl Default for Params {
             drum_length: 16,
             drum_level: 0.8,
             drum_to_fx: false,
+            drum_send: 0.0,
+            pad_pan: [0.0; PAD_COUNT],
+            pad_send: [1.0; PAD_COUNT],
             pad_level: [0.8; PAD_COUNT],
             pad_tune: [0.0; PAD_COUNT],
             pad_decay: [1.0; PAD_COUNT],
@@ -593,6 +723,9 @@ pub struct SharedParams {
 
     pub master_gain: AtomicF32,
     pub synth_gain: AtomicF32,
+    pub synth_send: AtomicF32,
+    pub comp_synth: SharedCompressor,
+    pub comp_master: SharedCompressor,
     pub drum_gain: AtomicF32,
     pub drive: AtomicF32,
 
@@ -623,6 +756,9 @@ pub struct SharedParams {
     pub drum_length: AtomicEnum,
     pub drum_level: AtomicF32,
     pub drum_to_fx: AtomicBool32,
+    pub drum_send: AtomicF32,
+    pub pad_pan: [AtomicF32; PAD_COUNT],
+    pub pad_send: [AtomicF32; PAD_COUNT],
     pub pad_level: [AtomicF32; PAD_COUNT],
     pub pad_tune: [AtomicF32; PAD_COUNT],
     pub pad_decay: [AtomicF32; PAD_COUNT],
@@ -756,6 +892,9 @@ impl SharedParams {
 
             master_gain: AtomicF32::new(p.master_gain),
             synth_gain: AtomicF32::new(p.synth_gain),
+            synth_send: AtomicF32::new(p.synth_send),
+            comp_synth: SharedCompressor::new(&p.comp_synth),
+            comp_master: SharedCompressor::new(&p.comp_master),
             drum_gain: AtomicF32::new(p.drum_gain),
             drive: AtomicF32::new(p.drive),
 
@@ -786,6 +925,9 @@ impl SharedParams {
             drum_length: AtomicEnum::new(p.drum_length as u32),
             drum_level: AtomicF32::new(p.drum_level),
             drum_to_fx: AtomicBool32::new(p.drum_to_fx),
+            drum_send: AtomicF32::new(p.drum_send),
+            pad_pan: core::array::from_fn(|i| AtomicF32::new(p.pad_pan[i])),
+            pad_send: core::array::from_fn(|i| AtomicF32::new(p.pad_send[i])),
             pad_level: core::array::from_fn(|i| AtomicF32::new(p.pad_level[i])),
             pad_tune: core::array::from_fn(|i| AtomicF32::new(p.pad_tune[i])),
             pad_decay: core::array::from_fn(|i| AtomicF32::new(p.pad_decay[i])),
@@ -877,6 +1019,9 @@ impl SharedParams {
 
             master_gain: self.master_gain.get().clamp(0.0, 2.0),
             synth_gain: self.synth_gain.get().clamp(0.0, 2.0),
+            synth_send: clamp01(self.synth_send.get()),
+            comp_synth: self.comp_synth.snapshot(),
+            comp_master: self.comp_master.snapshot(),
             drum_gain: self.drum_gain.get().clamp(0.0, 2.0),
             drive: self.drive.get().clamp(0.1, 20.0),
 
@@ -909,6 +1054,9 @@ impl SharedParams {
             drum_length: (self.drum_length.get() as usize).clamp(1, crate::sequencer::MAX_STEPS),
             drum_level: clamp01(self.drum_level.get()),
             drum_to_fx: self.drum_to_fx.get(),
+            drum_send: clamp01(self.drum_send.get()),
+            pad_pan: core::array::from_fn(|i| sane(self.pad_pan[i].get(), 0.0).clamp(-1.0, 1.0)),
+            pad_send: core::array::from_fn(|i| clamp01(self.pad_send[i].get())),
             pad_level: core::array::from_fn(|i| clamp01(self.pad_level[i].get())),
             pad_tune: core::array::from_fn(|i| sane(self.pad_tune[i].get(), 0.0).clamp(-12.0, 12.0)),
             pad_decay: core::array::from_fn(|i| sane(self.pad_decay[i].get(), 1.0).clamp(0.25, 4.0)),
@@ -979,6 +1127,9 @@ impl SharedParams {
 
         self.master_gain.set(p.master_gain);
         self.synth_gain.set(p.synth_gain);
+        self.synth_send.set(p.synth_send);
+        self.comp_synth.apply(&p.comp_synth);
+        self.comp_master.apply(&p.comp_master);
         self.drum_gain.set(p.drum_gain);
         self.drive.set(p.drive);
 
@@ -1009,7 +1160,10 @@ impl SharedParams {
         self.drum_length.set(p.drum_length as u32);
         self.drum_level.set(p.drum_level);
         self.drum_to_fx.set(p.drum_to_fx);
+        self.drum_send.set(p.drum_send);
         for i in 0..PAD_COUNT {
+            self.pad_pan[i].set(p.pad_pan[i]);
+            self.pad_send[i].set(p.pad_send[i]);
             self.pad_level[i].set(p.pad_level[i]);
             self.pad_tune[i].set(p.pad_tune[i]);
             self.pad_decay[i].set(p.pad_decay[i]);
@@ -1412,5 +1566,89 @@ mod tests {
         assert!(grid.get(3, 1).active);
         assert!(!grid.get(3, 0).active);
         assert!(!grid.get(4, 1).active);
+    }
+
+    #[test]
+    fn the_new_bus_params_default_to_todays_routing() {
+        let p = Params::default();
+        // Today's engine sends the synth through the effects and keeps drums
+        // out of them. These two defaults are what reproduce that.
+        assert_eq!(p.synth_send, 1.0);
+        assert_eq!(p.drum_send, 0.0);
+        assert_eq!(p.pad_pan, [0.0; PAD_COUNT]);
+        assert_eq!(p.pad_send, [1.0; PAD_COUNT]);
+    }
+
+    #[test]
+    fn bus_params_round_trip_and_clamp() {
+        let mut p = Params::default();
+        p.synth_send = 0.25;
+        p.drum_send = 0.5;
+        p.pad_pan[2] = -1.0;
+        p.pad_send[3] = 0.125;
+
+        let shared = SharedParams::default();
+        shared.apply(&p);
+        let back = shared.snapshot();
+
+        assert_eq!(back.synth_send, 0.25);
+        assert_eq!(back.drum_send, 0.5);
+        assert_eq!(back.pad_pan[2], -1.0);
+        assert_eq!(back.pad_send[3], 0.125);
+
+        // Hostile values from the control side are clamped, not trusted.
+        shared.synth_send.set(9.0);
+        shared.drum_send.set(f32::NAN);
+        shared.pad_pan[0].set(-4.0);
+        shared.pad_send[0].set(2.0);
+        let back = shared.snapshot();
+        assert_eq!(back.synth_send, 1.0);
+        assert_eq!(back.drum_send, 0.0);
+        assert_eq!(back.pad_pan[0], -1.0);
+        assert_eq!(back.pad_send[0], 1.0);
+    }
+
+    #[test]
+    fn compressor_params_default_to_bypassed() {
+        let p = Params::default();
+        for c in [p.comp_synth, p.comp_master] {
+            assert!(!c.on);
+            assert_eq!(c.threshold_db, -12.0);
+            assert_eq!(c.ratio, 4.0);
+            assert_eq!(c.attack_ms, 10.0);
+            assert_eq!(c.release_ms, 100.0);
+            assert_eq!(c.makeup_db, 0.0);
+            assert_eq!(c.sidechain, SidechainSource::Off);
+        }
+    }
+
+    #[test]
+    fn compressor_params_round_trip_and_clamp() {
+        let mut p = Params::default();
+        p.comp_synth.on = true;
+        p.comp_synth.threshold_db = -24.0;
+        p.comp_synth.sidechain = SidechainSource::Kick;
+        p.comp_master.ratio = 2.0;
+
+        let shared = SharedParams::default();
+        shared.apply(&p);
+        let back = shared.snapshot();
+
+        assert!(back.comp_synth.on);
+        assert_eq!(back.comp_synth.threshold_db, -24.0);
+        assert_eq!(back.comp_synth.sidechain, SidechainSource::Kick);
+        assert_eq!(back.comp_master.ratio, 2.0);
+        // The master is untouched by the synth compressor's settings.
+        assert!(!back.comp_master.on);
+
+        shared.comp_synth.threshold_db.set(12.0);
+        shared.comp_synth.ratio.set(f32::NAN);
+        shared.comp_master.attack_ms.set(0.0);
+        shared.comp_master.release_ms.set(9999.0);
+        let back = shared.snapshot();
+        assert_eq!(back.comp_synth.threshold_db, 0.0);
+        assert_eq!(back.comp_synth.ratio, 4.0);
+        assert_eq!(back.comp_master.attack_ms, 0.1);
+        assert_eq!(back.comp_master.release_ms, 1000.0);
     }
 }
