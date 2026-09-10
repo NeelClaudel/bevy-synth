@@ -87,10 +87,17 @@ impl Compressor {
                 Some(d) => d[i].abs(),
                 None => left[i].abs().max(right[i].abs()),
             };
-            // Clamped at both ends: the floor keeps `log10` off zero, and the
-            // ceiling keeps an already-diverged input from turning `target`
-            // into a NaN that `gr_db` would then carry forever.
-            let level_db = 20.0 * level.clamp(FLOOR, CEIL).log10();
+            // `max` then `min`, not `clamp`: `f32::clamp` returns NaN when
+            // `self` is NaN, which would flow straight through `log10` into
+            // `over`/`target` and poison `gr_db` forever. `max` and `min`
+            // both discard a NaN `self` in favour of the other operand, so a
+            // NaN sample degrades to `FLOOR` (silence) instead. The ceiling
+            // still keeps an already-diverged (+inf) input from turning
+            // `target` into a NaN the same way. Do not let clippy "simplify"
+            // this back to `.clamp(FLOOR, CEIL)` -- that reintroduces the
+            // NaN-poisoning bug this line exists to close.
+            #[allow(clippy::manual_clamp)]
+            let level_db = 20.0 * level.max(FLOOR).min(CEIL).log10();
             let over = level_db - p.threshold_db;
 
             let target = if over <= -half_knee {
@@ -337,6 +344,35 @@ mod tests {
 
         // A following block of ordinary audio must still come out finite --
         // proving the earlier infinity did not leave `gr_db` as a NaN that
+        // poisons every sample from here on.
+        let mut l = [0.5; 480];
+        let mut r = [0.5; 480];
+        comp.process(&mut l, &mut r, None, &p);
+        assert!(l.iter().all(|s| s.is_finite()));
+        assert!(r.iter().all(|s| s.is_finite()));
+        assert!(comp.gain_reduction_db().is_finite());
+    }
+
+    #[test]
+    fn a_nan_sample_does_not_poison_the_envelope() {
+        let mut comp = Compressor::new(SR);
+        let mut p = CompressorParams::default();
+        p.on = true;
+        p.threshold_db = -12.0;
+        p.ratio = 4.0;
+        p.attack_ms = 1.0;
+
+        let mut l = [f32::NAN];
+        let mut r = [f32::NAN];
+        comp.process(&mut l, &mut r, None, &p);
+        assert!(
+            comp.gain_reduction_db().is_finite(),
+            "gr {}",
+            comp.gain_reduction_db()
+        );
+
+        // A following block of ordinary audio must still come out finite --
+        // proving the earlier NaN did not leave `gr_db` as a NaN that
         // poisons every sample from here on.
         let mut l = [0.5; 480];
         let mut r = [0.5; 480];
