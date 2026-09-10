@@ -33,7 +33,7 @@
 | `crates/synth_core/src/event.rs` | `Event::SetBassStep` and `Event::RegenerateBass`. | Modify |
 | `crates/synth_core/src/engine.rs` | Owns the second `Sequencer`, the `BassVoice` and `comp_bass`; renders and routes the bass bus. | Modify |
 | `crates/synth_core/src/lib.rs` | Re-exports `bass::BassVoice` and `params::BassParams`. | Modify |
-| `crates/bevy_synth/src/lib.rs` | `Synth` facade methods for the bass pattern; `comp_bass_gr` on `SynthTelemetry`. | Modify |
+| `crates/bevy_synth/src/lib.rs` | `Synth` facade methods for the bass pattern; `bass_step` and `comp_bass_gr` on `SynthTelemetry`. | Modify |
 | `crates/bevy_synth_ui/src/sections/bass.rs` | The BASS tab: eight voice knobs, the bass step grid, the generative controls. | **Create** |
 | `crates/bevy_synth_ui/src/sections/mod.rs` | Registers and re-exports the new section. | Modify |
 | `crates/bevy_synth_ui/src/sections/mixer.rs` | A fourth `strip()` for the bass bus. | Modify |
@@ -2458,7 +2458,7 @@ Editing a bass step, regenerating the bass line, and making the transport reach 
 - Consumes: everything from Tasks 1–7.
 - Produces:
   - `Event::SetBassStep { index: u8, step: Step }` and `Event::RegenerateBass`
-  - `Synth::bass_pattern(&self) -> synth_core::Pattern`, `Synth::set_bass_step(&self, index: usize, step: synth_core::Step) -> bool`, `Synth::toggle_bass_step(&self, index: usize) -> bool`, `Synth::regenerate_bass(&self)`, `Synth::regenerate_bass_with_seed(&self, seed: u64)`
+  - `Synth::bass_pattern(&self) -> synth_core::Pattern`, `Synth::set_bass_step(&self, index: usize, step: synth_core::Step) -> bool`, `Synth::toggle_bass_step(&self, index: usize) -> bool`, `Synth::toggle_bass_slide(&self, index: usize) -> bool`, `Synth::toggle_bass_accent(&self, index: usize) -> bool`, `Synth::regenerate_bass(&self)`, `Synth::regenerate_bass_with_seed(&self, seed: u64)`
 
 Both new variants are the same size as `SetStep`, which is already the largest variant, so the queue slot does not grow. New variants rather than a `channel: u8` field on the existing ones: additive, and no existing call site changes.
 
@@ -2727,9 +2727,10 @@ A fourth tab holding the eight voice knobs, the bass step grid with per-step sli
 - Modify: `crates/bevy_synth_ui/src/sections/mod.rs`
 - Modify: `crates/bevy_synth_ui/src/widgets.rs`
 - Modify: `crates/bevy_synth_ui/src/lib.rs`
+- Modify: `crates/bevy_synth/src/lib.rs` (`SynthTelemetry::bass_step`)
 
 **Interfaces:**
-- Consumes: `Synth::{bass_pattern, toggle_bass_step, toggle_bass_slide, toggle_bass_accent, regenerate_bass_with_seed}` (Task 8); `SharedParams`'s bass fields (Task 6); `SynthTelemetry` (Task 10 adds `comp_bass_gr`, which this tab does not need); the existing `widgets::{section, knob_param, KnobSpec, palette}`, `crate::{dropdown, integer}`.
+- Consumes: `Synth::{bass_pattern, toggle_bass_step, toggle_bass_slide, toggle_bass_accent, regenerate_bass_with_seed}` (Task 8); `SharedParams`'s bass fields (Task 6); `SynthTelemetry`, which this task extends with `pub bass_step: u32` for the step readout (Task 10 adds `comp_bass_gr`, which this tab does not need); the existing `widgets::{section, knob_param, KnobSpec, palette}`, `crate::{dropdown, integer}`.
 - Produces:
   - `pub(crate) fn bass(ui: &mut Ui, synth: &Synth, telemetry: &SynthTelemetry, state: &mut SynthUi)`
   - `pub fn bass_step_grid(ui: &mut Ui, steps: &[synth_core::Step], current: usize, playing: bool) -> Option<(usize, BassEdit)>` with `pub enum BassEdit { Toggle, Slide, Accent }`
