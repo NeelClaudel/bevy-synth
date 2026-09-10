@@ -2611,48 +2611,74 @@ mod tests {
         assert_ne!(bass, bass_after, "and must actually write a new bass line");
     }
 
-    /// `melody_enabled` defaults to `true`, so isolate the bass the same way
-    /// the sibling tests above do (`clock_stop_silences_a_gated_bass_note` and
-    /// friends) — otherwise a still-ringing lead voice, on its own 250 ms
-    /// release, would fail this on the lead's account rather than the
-    /// bass's.
+    /// This pair exercises the *stereo* path — `render_stereo` /
+    /// `engine_peak`, which call `process_stereo_interleaved` — rather than
+    /// the mono `render` the `..._a_gated_bass_note` tests above use. The
+    /// mono path collapses the buses before anything can be seen, so a
+    /// transport fix that cut the bass from the mono sum but left it in the
+    /// stereo mix would pass those tests and still fail only this one. That
+    /// coverage is why this pair earns its place rather than being a
+    /// duplicate of the mono-path siblings.
     #[test]
     fn stopping_the_transport_silences_the_bass() {
+        // seq_gate: 2.0 and bass_gen_density: 1.0, as the mono-path siblings
+        // above use, so a note is reliably gated regardless of the default
+        // seed. At 48 kHz, tempo 140 and the default steps_per_beat of 4,
+        // samples_per_step = 60 * 48_000 / 140 / 4 = 36_000 / 7 ≈ 5142.9, so
+        // the gate (2.0 steps) is ≈10_285.7 samples — far longer than the
+        // 224-frame window (one discarded block plus six checked blocks)
+        // checked after the stop. So if the bass falls silent inside that
+        // window, the stop must be what did it: the sequencer's own
+        // gate-length timeout could not have expired on its own yet.
         let p = Params {
             bass_enabled: true,
             melody_enabled: false,
             drum_enabled: false,
+            seq_gate: 2.0,
             seq_playing: true,
             ..Params::default()
         };
         let shared = std::sync::Arc::new(SharedParams::from_params(&p));
         let (tx, rx) = crate::event::channel(64);
         let mut engine = Engine::new(48_000.0, shared.clone(), rx);
+        shared.tempo.set(140.0);
+        shared.bass_gen_density.set(1.0);
         assert!(engine_peak(&mut engine, 600) > 0.001, "playing");
 
         assert!(tx.push(Event::ClockStop));
         render_stereo(&mut engine, BLOCK);
-        // Past the bass amp envelope's release.
-        assert!(engine_peak(&mut engine, 200) < 1e-6, "stopped means silent");
+        // Short enough that the sequencer's own gate-length timeout cannot
+        // have expired before the assertion.
+        assert!(engine_peak(&mut engine, 6) < 1e-6, "stopped means silent");
     }
 
-    /// Same isolation as above, and for the same reason.
+    /// Same non-duplicate reasoning as above.
     #[test]
     fn panic_silences_the_bass() {
         let p = Params {
             bass_enabled: true,
             melody_enabled: false,
             drum_enabled: false,
+            seq_gate: 2.0,
             seq_playing: true,
             ..Params::default()
         };
         let shared = std::sync::Arc::new(SharedParams::from_params(&p));
         let (tx, rx) = crate::event::channel(64);
         let mut engine = Engine::new(48_000.0, shared.clone(), rx);
+        shared.tempo.set(140.0);
+        shared.bass_gen_density.set(1.0);
         engine_peak(&mut engine, 600);
-        shared.seq_playing.set(false);
+
+        // The transport is left running: `Event::Panic` must be the only
+        // thing that can cut the bass here. Setting `seq_playing` false
+        // first (as an earlier version of this test did) routes through the
+        // `should_play` reconcile's own stop branch instead, which cuts the
+        // bass on its own — proving nothing about `Panic`.
         assert!(tx.push(Event::Panic));
         render_stereo(&mut engine, BLOCK);
-        assert!(engine_peak(&mut engine, 100) < 1e-6, "panic cuts everything");
+        // Short enough that the sequencer cannot have reached its next tick
+        // and re-gated a new note before the assertion.
+        assert!(engine_peak(&mut engine, 6) < 1e-6, "panic cuts everything");
     }
 }
