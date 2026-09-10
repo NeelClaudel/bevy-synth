@@ -129,8 +129,11 @@ impl BassVoice {
         // well as in `SharedBass::snapshot`: `BassVoice` is public, so it
         // cannot assume it was called through the mirror. `sane_or` strips
         // NaN first, so by the time `clamp` runs the value is already finite
-        // and `clamp` cannot mis-propagate one.
-        let tune = if p.tune.is_finite() { p.tune } else { 0.0 };
+        // and `clamp` cannot mis-propagate one. `tune`'s bound of +/-12
+        // semitones matches `SharedBass::snapshot` so the two cannot drift
+        // apart, and it is not just cosmetic: an extreme-but-finite `tune`
+        // would otherwise push `midi_to_hz` towards infinity below.
+        let tune = sane_or(p.tune, 0.0).clamp(-12.0, 12.0);
         let base_cutoff = sane_or(p.cutoff, 300.0).clamp(20.0, 20_000.0);
         let resonance = sane_or(p.resonance, 0.7).clamp(0.0, 1.0);
         let env_mod = sane_or(p.env_mod, 3.0).clamp(0.0, 6.0);
@@ -316,5 +319,19 @@ mod tests {
                 assert!(s.is_finite(), "NaN parameters leaked into the audio");
             }
         }
+    }
+
+    #[test]
+    fn an_absurd_tune_cannot_run_the_pitch_away() {
+        let p = BassParams { tune: 1e30, ..BassParams::default() };
+        let mut v = BassVoice::new(SR, 0xB455_0006);
+        v.note_on(40, false, false);
+        // `peak` already asserts every sample is finite.
+        let _ = peak(&mut v, &p, 0.05);
+        assert!(
+            v.current_hz().is_finite() && v.current_hz() <= midi_to_hz(52.0),
+            "tune must be bounded to +/-12 semitones, got {} Hz",
+            v.current_hz()
+        );
     }
 }
