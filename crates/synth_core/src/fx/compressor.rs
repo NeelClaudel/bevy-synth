@@ -9,6 +9,13 @@ const KNEE_DB: f32 = 6.0;
 /// Below this the detector is treated as silence, so `log10` never sees zero.
 const FLOOR: f32 = 1.0e-9;
 
+/// Above this the detector is treated as already-diverged input. Far above
+/// any real signal (+180 dB) so it never engages on audio -- only on
+/// infinities, keeping `over` and `target` finite so `gr_db` can never be
+/// poisoned with a NaN that would otherwise persist across every following
+/// sample and call.
+const CEIL: f32 = 1.0e9;
+
 /// A feed-forward peak compressor.
 ///
 /// State is one float plus the sample rate -- no delay lines, no lookahead, no
@@ -44,8 +51,10 @@ impl Compressor {
     /// Compresses `left` and `right` in place.
     ///
     /// `detector` supplies the signal the gain is computed from. `None` means
-    /// detect on the signal being compressed. When `Some`, it must be at least
-    /// as long as `left`.
+    /// detect on the signal being compressed. When `Some` and shorter than
+    /// `left`, it bounds how many samples are processed rather than panicking
+    /// -- the tail of `left`/`right` beyond the detector's length is left
+    /// untouched.
     pub fn process(
         &mut self,
         left: &mut [f32],
@@ -67,13 +76,21 @@ impl Compressor {
         let half_knee = KNEE_DB * 0.5;
         let makeup = p.makeup_db;
 
-        let count = left.len().min(right.len());
+        // The detector's length is folded in with the others: a short detector
+        // must shorten the block, not panic on the audio thread.
+        let count = left
+            .len()
+            .min(right.len())
+            .min(detector.map_or(usize::MAX, <[f32]>::len));
         for i in 0..count {
             let level = match detector {
                 Some(d) => d[i].abs(),
                 None => left[i].abs().max(right[i].abs()),
             };
-            let level_db = 20.0 * level.max(FLOOR).log10();
+            // Clamped at both ends: the floor keeps `log10` off zero, and the
+            // ceiling keeps an already-diverged input from turning `target`
+            // into a NaN that `gr_db` would then carry forever.
+            let level_db = 20.0 * level.clamp(FLOOR, CEIL).log10();
             let over = level_db - p.threshold_db;
 
             let target = if over <= -half_knee {
@@ -275,5 +292,57 @@ mod tests {
         comp.process(&mut l, &mut r, Some(&loud), &p);
         assert!(comp.gain_reduction_db() > 30.0, "{}", comp.gain_reduction_db());
         assert!(l[4_799] < 0.001, "got {}", l[4_799]);
+    }
+
+    #[test]
+    fn a_detector_shorter_than_the_signal_does_not_panic() {
+        let mut comp = Compressor::new(SR);
+        let mut p = CompressorParams::default();
+        p.on = true;
+        p.threshold_db = -12.0;
+        p.ratio = 4.0;
+        p.attack_ms = 1.0;
+
+        let mut l = [0.5; 10];
+        let mut r = [0.5; 10];
+        let detector = [1.0; 5];
+
+        comp.process(&mut l, &mut r, Some(&detector), &p);
+
+        // The first five samples were compressed against the loud detector...
+        assert!(l[4] < 0.5, "got {}", l[4]);
+        // ...but the tail beyond the detector's length is left exactly as it
+        // was, not panicked on and not touched.
+        assert_eq!(&l[5..], &[0.5; 5]);
+        assert_eq!(&r[5..], &[0.5; 5]);
+    }
+
+    #[test]
+    fn an_infinite_sample_does_not_poison_the_envelope() {
+        let mut comp = Compressor::new(SR);
+        let mut p = CompressorParams::default();
+        p.on = true;
+        p.threshold_db = -12.0;
+        p.ratio = 1.0; // slope is 0.0 -- the case that used to give inf * 0.0.
+        p.attack_ms = 1.0;
+
+        let mut l = [f32::INFINITY];
+        let mut r = [f32::INFINITY];
+        comp.process(&mut l, &mut r, None, &p);
+        assert!(
+            comp.gain_reduction_db().is_finite(),
+            "gr {}",
+            comp.gain_reduction_db()
+        );
+
+        // A following block of ordinary audio must still come out finite --
+        // proving the earlier infinity did not leave `gr_db` as a NaN that
+        // poisons every sample from here on.
+        let mut l = [0.5; 480];
+        let mut r = [0.5; 480];
+        comp.process(&mut l, &mut r, None, &p);
+        assert!(l.iter().all(|s| s.is_finite()));
+        assert!(r.iter().all(|s| s.is_finite()));
+        assert!(comp.gain_reduction_db().is_finite());
     }
 }
