@@ -46,7 +46,7 @@ pub use engine::{Engine, MAX_VOICES};
 pub use env::{Adsr, AdsrSettings, EnvStage};
 pub use event::{Event, EventQueue};
 pub use filter::{Svf, SvfMode};
-pub use fx::{FxChain, NoteDivision};
+pub use fx::{Compressor, FxChain, NoteDivision};
 pub use lfo::{Lfo, LfoTarget};
 pub use note::{midi_to_hz, Note};
 pub use osc::{Oscillator, Waveform};

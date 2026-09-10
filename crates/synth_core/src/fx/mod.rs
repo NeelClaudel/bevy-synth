@@ -5,10 +5,12 @@
 //! Reverse them and the delay repeats the reverb tail, so each echo is a
 //! smeared copy of the last, and it turns to mud within about a second.
 
+mod compressor;
 mod delay;
 mod line;
 mod reverb;
 
+pub use compressor::Compressor;
 pub use delay::{NoteDivision, StereoDelay};
 pub use line::DelayLine;
 pub use reverb::PlateReverb;
