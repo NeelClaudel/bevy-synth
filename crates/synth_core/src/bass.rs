@@ -91,14 +91,25 @@ impl BassVoice {
 
     /// Starts a note.
     ///
-    /// `accent` is latched here rather than read per sample, so an edit to the
-    /// step mid-note cannot change what is already sounding. `slide` is the
-    /// tie; Task 5 gives it its behaviour.
-    pub fn note_on(&mut self, note: u8, accent: bool, _slide: bool) {
+    /// `accent` is latched here rather than read per sample, so editing the
+    /// step mid-note cannot change what is already sounding.
+    ///
+    /// `slide` is the tie. A tied note keeps both envelopes exactly where they
+    /// are and lets the glide walk the pitch to its new home — not
+    /// retriggering is the whole point, because a retriggered note cannot
+    /// produce the legato squelch the gesture exists for. A tie with nothing
+    /// sounding has nothing to slide from, so it falls back to a normal
+    /// note-on; that covers step 0 of a pattern and a tie after a rest.
+    pub fn note_on(&mut self, note: u8, accent: bool, slide: bool) {
         self.note = note;
         self.gate = true;
         self.accented = accent;
         self.target_pitch = note as f32;
+
+        if slide && self.is_active() {
+            return;
+        }
+
         self.pitch = self.target_pitch;
         self.amp_env.gate_on(true);
         self.filter_env.gate_on(true);
@@ -123,6 +134,11 @@ impl BassVoice {
         self.amp_env.is_active()
     }
 
+    /// Whether the sounding note was started as an accent.
+    pub fn is_accented(&self) -> bool {
+        self.accented
+    }
+
     /// Renders one block, overwriting `out`.
     pub fn process_block(&mut self, out: &mut [f32], p: &BassParams) {
         // Everything that arrives from the control side is bounded here as
@@ -136,8 +152,18 @@ impl BassVoice {
         let tune = sane_or(p.tune, 0.0).clamp(-12.0, 12.0);
         let base_cutoff = sane_or(p.cutoff, 300.0).clamp(20.0, 20_000.0);
         let resonance = sane_or(p.resonance, 0.7).clamp(0.0, 1.0);
-        let env_mod = sane_or(p.env_mod, 3.0).clamp(0.0, 6.0);
+        let mut env_mod = sane_or(p.env_mod, 3.0).clamp(0.0, 6.0);
         let decay = sane_or(p.decay, 0.3).clamp(0.02, 2.0);
+
+        let accent_amount = sane_or(p.accent, 0.5).clamp(0.0, 1.0);
+        // One knob, three destinations. All three are neutral on an
+        // unaccented step: nothing is added and nothing is scaled.
+        let (accent_level, accent_octaves, accent_depth) = if self.accented {
+            (1.0 + accent_amount * 0.5, accent_amount * 1.5, 1.0 + accent_amount)
+        } else {
+            (1.0, 0.0, 1.0)
+        };
+        env_mod *= accent_depth;
 
         // Decay-only: sustain is zero, so the sweep finishes even under a held
         // gate. Release matches decay, so letting go mid-sweep sounds like the
@@ -168,14 +194,17 @@ impl BassVoice {
             // the same musical distance from 80 Hz as it does from 800.
             // `base_cutoff` and `env_mod` are already finite (see above) and
             // `env` never leaves `0.0..=1.0`, so `octaves.exp2()` cannot be
-            // NaN either -- `clamp` is safe here too.
-            let octaves = env_mod * env;
+            // NaN either -- `clamp` is safe here too. `accent_octaves` is at
+            // most 1.5 (when `accent_amount` is 1.0), and `accent_depth` at
+            // most 2.0, so the product `env_mod * accent_depth` cannot overflow
+            // the cutoff's clamp.
+            let octaves = env_mod * env + accent_octaves;
             let cutoff = (base_cutoff * octaves.exp2()).clamp(20.0, 20_000.0);
             self.filter.set_params(cutoff, resonance);
 
             let raw = self.osc.next(p.wave);
             let filtered = self.filter.process(raw);
-            let value = filtered * amp;
+            let value = filtered * amp * accent_level;
             *sample = if value.is_finite() { value } else { 0.0 };
         }
     }
@@ -333,5 +362,114 @@ mod tests {
             "tune must be bounded to +/-12 semitones, got {} Hz",
             v.current_hz()
         );
+    }
+
+    #[test]
+    fn an_accented_note_is_louder_and_brighter() {
+        let p = BassParams { accent: 1.0, cutoff: 150.0, ..BassParams::default() };
+        let mut plain = BassVoice::new(SR, 0xB455_0011);
+        let mut loud = BassVoice::new(SR, 0xB455_0011);
+        plain.note_on(40, false, false);
+        loud.note_on(40, true, false);
+        let a = peak(&mut plain, &p, 0.08);
+        let b = peak(&mut loud, &p, 0.08);
+        assert!(b > a * 1.2, "an accented note ({b}) should top an unaccented one ({a})");
+    }
+
+    #[test]
+    fn accent_is_neutral_when_the_knob_is_at_zero() {
+        let p = BassParams { accent: 0.0, ..BassParams::default() };
+        let mut plain = BassVoice::new(SR, 0xB455_0012);
+        let mut marked = BassVoice::new(SR, 0xB455_0012);
+        plain.note_on(40, false, false);
+        marked.note_on(40, true, false);
+        let a = peak(&mut plain, &p, 0.08);
+        let b = peak(&mut marked, &p, 0.08);
+        assert!((a - b).abs() < 1e-6, "accent 0.0 should change nothing: {a} vs {b}");
+    }
+
+    #[test]
+    fn accent_is_latched_at_note_on() {
+        // The accent belongs to the note, not to the knob: turning the knob
+        // mid-note changes how loud the *next* accented note is, not this one.
+        let mut v = BassVoice::new(SR, 0xB455_0013);
+        v.note_on(40, true, false);
+        assert!(v.is_accented());
+        v.note_on(40, false, false);
+        assert!(!v.is_accented());
+    }
+
+    #[test]
+    fn a_tie_glides_and_does_not_retrigger() {
+        let p = BassParams { slide_time: 0.1, ..BassParams::default() };
+        let mut v = BassVoice::new(SR, 0xB455_0014);
+        let mut block = [0.0f32; 64];
+
+        v.note_on(40, false, false);
+        for _ in 0..(0.2 * SR / 64.0) as usize {
+            v.process_block(&mut block, &p);
+        }
+        let settled = v.filter_env_level();
+
+        // The tie: same voice, new note, no retrigger.
+        v.note_on(52, false, true);
+        v.process_block(&mut block, &p);
+        assert!(
+            v.filter_env_level() <= settled,
+            "a tie must not restart the filter envelope"
+        );
+        let start_hz = v.current_hz();
+
+        // Partway through the glide the pitch is between the two notes.
+        for _ in 0..(0.03 * SR / 64.0) as usize {
+            v.process_block(&mut block, &p);
+        }
+        let mid_hz = v.current_hz();
+        assert!(
+            mid_hz > start_hz && mid_hz < midi_to_hz(52.0),
+            "pitch should be mid-glide: {start_hz} -> {mid_hz} -> {}",
+            midi_to_hz(52.0)
+        );
+
+        // And it gets there.
+        for _ in 0..(0.6 * SR / 64.0) as usize {
+            v.process_block(&mut block, &p);
+        }
+        assert!((v.current_hz() / midi_to_hz(52.0) - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn an_untied_note_jumps_and_retriggers() {
+        let p = BassParams { slide_time: 0.1, ..BassParams::default() };
+        let mut v = BassVoice::new(SR, 0xB455_0015);
+        let mut block = [0.0f32; 64];
+
+        v.note_on(40, false, false);
+        for _ in 0..(0.5 * SR / 64.0) as usize {
+            v.process_block(&mut block, &p);
+        }
+        assert!(v.filter_env_level() < 0.01, "the envelope should be spent");
+
+        v.note_on(52, false, false);
+        v.process_block(&mut block, &p);
+        assert!(v.filter_env_level() > 0.01, "an untied note restarts the envelope");
+        assert!(
+            (v.current_hz() / midi_to_hz(52.0) - 1.0).abs() < 0.01,
+            "an untied note jumps straight to pitch"
+        );
+    }
+
+    #[test]
+    fn a_tie_from_silence_retriggers_instead() {
+        // Nothing to slide from. Falling back to a normal note-on is the only
+        // sensible reading, and it is what step 0 of a pattern needs.
+        let p = BassParams::default();
+        let mut v = BassVoice::new(SR, 0xB455_0016);
+        let mut block = [0.0f32; 64];
+        v.note_on(40, false, true);
+        v.process_block(&mut block, &p);
+        assert!(v.is_active(), "a tie with nothing sounding must still start a note");
+        assert!(v.filter_env_level() > 0.0, "and must trigger its envelope");
+        assert!((v.current_hz() / midi_to_hz(40.0) - 1.0).abs() < 0.01);
     }
 }
