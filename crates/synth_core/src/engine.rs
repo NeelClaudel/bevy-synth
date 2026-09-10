@@ -13,12 +13,12 @@
 
 use std::sync::Arc;
 
+use crate::bass::BassVoice;
 use crate::clock::Clock;
 use crate::drums::{Column, DrumBuses, DrumPattern, DrumRack};
 use crate::event::{Consumer, Event};
 use crate::fx::{Compressor, FxChain};
 use crate::lfo::Lfo;
-use crate::bass::BassVoice;
 use crate::params::{ClockSource, Params, SharedParams, SidechainSource, Smoothed, VoiceMode};
 use crate::sequencer::{GenerativeSettings, SeqSettings, Sequencer, MAX_STEPS};
 use crate::voice::Voice;
@@ -197,6 +197,7 @@ impl Engine {
             &mut self.master_gain,
             &mut self.synth_gain,
             &mut self.drum_gain,
+            &mut self.bass_gain,
         ] {
             gain.set_time(15.0, sample_rate / BLOCK as f32);
         }
@@ -204,6 +205,8 @@ impl Engine {
         self.comp_synth.set_sample_rate(sample_rate);
         self.comp_master.set_sample_rate(sample_rate);
         self.drums.set_sample_rate(sample_rate);
+        self.bass.set_sample_rate(sample_rate);
+        self.comp_bass.set_sample_rate(sample_rate);
     }
 
     /// Current sequencer pattern, for display.
@@ -598,6 +601,7 @@ impl Engine {
                 Event::ClockStart => {
                     self.sequencer.rewind();
                     self.drums.sequencer().rewind();
+                    self.bass_seq.rewind();
                     self.clock.start();
                     self.params.seq_playing.set(true);
                 }
@@ -611,6 +615,11 @@ impl Engine {
                     // transport has to cut them: there is nothing else that
                     // ever would.
                     self.drums.silence();
+                    // The bass amp envelope sustains at 1.0 with no release,
+                    // so a note gated on when the transport stops would ring
+                    // forever otherwise.
+                    let _ = self.bass_seq.release_all();
+                    self.bass.silence();
                 }
                 Event::ClockContinue => {
                     self.clock.resume();
@@ -674,6 +683,10 @@ impl Engine {
                     self.note_off(note, params);
                 }
                 self.drums.silence();
+                // Same unconditional cut as `ClockStop`: the bass envelope
+                // never releases on its own.
+                let _ = self.bass_seq.release_all();
+                self.bass.silence();
             }
         }
     }
@@ -861,6 +874,10 @@ impl Engine {
         }
         if hard {
             self.drums.silence();
+            // Same reasoning as the drums: `Panic` and a voice-mode switch
+            // both have to be able to stop everything, and the bass envelope
+            // sustains at 1.0 forever with nothing else to cut it.
+            self.bass.silence();
         }
     }
 
@@ -2397,6 +2414,129 @@ mod tests {
         assert!(
             (clean - driven).abs() < clean * 0.05,
             "drive must not touch the bass: {clean} vs {driven}"
+        );
+    }
+
+    #[test]
+    fn clock_stop_silences_a_gated_bass_note() {
+        // The bass amp envelope sustains at 1.0 with no release, so a note
+        // gated on when the transport stops has nothing else to cut it. The
+        // sequencer's own gate-length timeout counts down in real samples
+        // rather than clock ticks, so it would eventually release the note
+        // on its own even without the fix — the window checked here is well
+        // under one step's length (a gate of 2.0 steps at this tempo is far
+        // longer than 200 samples), so that timeout cannot be the one doing
+        // the silencing.
+        let p = Params {
+            bass_enabled: true,
+            melody_enabled: false,
+            drum_enabled: false,
+            seq_gate: 2.0,
+            ..Params::default()
+        };
+        let shared = std::sync::Arc::new(SharedParams::from_params(&p));
+        let (tx, rx) = crate::event::channel(64);
+        let mut engine = Engine::new(48_000.0, shared.clone(), rx);
+        shared.tempo.set(140.0);
+        shared.bass_gen_density.set(1.0);
+
+        tx.push(Event::ClockStart);
+        let gated = render(&mut engine, 48_000);
+        assert!(peak(&gated) > SILENT, "bass never gated a note");
+
+        tx.push(Event::ClockStop);
+        // Short enough that the sequencer's own gate-length timeout cannot
+        // have expired before the assertion.
+        let after = render(&mut engine, 200);
+        assert_silent(&after, "bass note hung after the transport stopped");
+    }
+
+    #[test]
+    fn seq_playing_false_silences_a_gated_bass_note() {
+        // Same cut as `ClockStop`, but reached through the `seq_playing`
+        // reconcile path instead of an event. Same short window as above,
+        // for the same reason: it must be the fix cutting the note, not the
+        // sequencer's own gate-length timeout expiring on its own.
+        let p = Params {
+            bass_enabled: true,
+            melody_enabled: false,
+            drum_enabled: false,
+            seq_gate: 2.0,
+            seq_playing: true,
+            ..Params::default()
+        };
+        let shared = std::sync::Arc::new(SharedParams::from_params(&p));
+        let (_tx, rx) = crate::event::channel(64);
+        let mut engine = Engine::new(48_000.0, shared.clone(), rx);
+        shared.tempo.set(140.0);
+        shared.bass_gen_density.set(1.0);
+
+        let gated = render(&mut engine, 48_000);
+        assert!(peak(&gated) > SILENT, "bass never gated a note");
+
+        shared.seq_playing.set(false);
+        let after = render(&mut engine, 200);
+        assert_silent(&after, "bass note hung after seq_playing went false");
+    }
+
+    #[test]
+    fn panic_silences_a_gated_bass_note() {
+        let p = Params {
+            bass_enabled: true,
+            melody_enabled: false,
+            drum_enabled: false,
+            seq_playing: true,
+            ..Params::default()
+        };
+        let shared = std::sync::Arc::new(SharedParams::from_params(&p));
+        let (tx, rx) = crate::event::channel(64);
+        let mut engine = Engine::new(48_000.0, shared.clone(), rx);
+        shared.tempo.set(140.0);
+        shared.bass_gen_density.set(1.0);
+
+        let gated = render(&mut engine, 48_000);
+        assert!(peak(&gated) > SILENT, "bass never gated a note");
+
+        tx.push(Event::Panic);
+        // Short enough that the sequencer cannot have reached its next tick
+        // and re-gated a new note before the assertion.
+        let after = render(&mut engine, 200);
+        assert_silent(&after, "panic left the bass gated");
+    }
+
+    #[test]
+    fn clock_start_rewinds_the_bass_sequencer_with_the_lead() {
+        use core::sync::atomic::Ordering::Relaxed;
+        let p = Params { bass_enabled: true, ..Params::default() };
+        let shared = std::sync::Arc::new(SharedParams::from_params(&p));
+        let (tx, rx) = crate::event::channel(64);
+        let mut engine = Engine::new(48_000.0, shared.clone(), rx);
+        shared.bass_seq_length.set(shared.seq_length.get());
+        shared.tempo.set(300.0);
+
+        tx.push(Event::ClockStart);
+        render_stereo(&mut engine, BLOCK * 200);
+        assert_ne!(
+            shared.bass_step.load(Relaxed),
+            0,
+            "test setup: the bass sequencer never left step 0"
+        );
+
+        tx.push(Event::ClockStop);
+        tx.push(Event::ClockStart);
+        // One block: just enough for `begin_block` to drain the two events
+        // and publish the resulting position, nowhere near the next tick.
+        render_stereo(&mut engine, BLOCK);
+
+        assert_eq!(
+            shared.bass_step.load(Relaxed),
+            shared.current_step.load(Relaxed),
+            "bass sequencer wasn't rewound with the lead"
+        );
+        assert_eq!(
+            shared.bass_step.load(Relaxed),
+            0,
+            "bass sequencer should be back at step 0"
         );
     }
 }
