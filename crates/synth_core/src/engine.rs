@@ -2442,6 +2442,11 @@ mod tests {
             - measure(base, 0.0, CompressorParams::default());
         let delta_on = measure(base, 1.0, crushing) - measure(base, 0.0, crushing);
 
+        // `delta_on` comes out negative, not merely smaller: at `bass_send:
+        // 1.0` the tap and the dry sum draw from the same post-compression
+        // buffer, so `ret_l[i] - send_l[i]` cancels the dry attack transient
+        // to exact zero at every sample the causal reverb hasn't reached
+        // yet, leaving only the crushed tail for the peak to find elsewhere.
         assert!(
             delta_on < delta_off * 0.5,
             "the send should carry the compressed tail, not the dry one: \
