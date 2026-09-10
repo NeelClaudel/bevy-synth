@@ -829,6 +829,11 @@ pub struct SharedParams {
     pub active_voices: AtomicU32,
     /// Peak output level since last read, for a meter.
     pub output_peak: AtomicF32,
+    /// Gain reduction each compressor is currently applying, in positive dB.
+    /// Last value rather than a held peak: a GR meter that never falls back
+    /// tells you nothing about what the compressor is doing now.
+    pub comp_synth_gr: AtomicF32,
+    pub comp_master_gr: AtomicF32,
 }
 
 impl Default for SharedParams {
@@ -956,6 +961,8 @@ impl SharedParams {
             drum_position: AtomicU32::new(0),
             active_voices: AtomicU32::new(0),
             output_peak: AtomicF32::new(0.0),
+            comp_synth_gr: AtomicF32::new(0.0),
+            comp_master_gr: AtomicF32::new(0.0),
         }
     }
 

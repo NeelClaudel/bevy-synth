@@ -798,6 +798,15 @@ impl Engine {
         let previous = self.params.output_peak.get();
         self.params.output_peak.set(previous.max(self.peak));
         self.peak = 0.0;
+
+        // Straight set, no `max`: the meter should follow the compressor down
+        // as it releases.
+        self.params
+            .comp_synth_gr
+            .set(self.comp_synth.gain_reduction_db());
+        self.params
+            .comp_master_gr
+            .set(self.comp_master.gain_reduction_db());
     }
 }
 
@@ -1917,5 +1926,60 @@ mod tests {
             peak(&ducked_out),
             peak(&steady_out)
         );
+    }
+
+    /// The meter has to agree with the gain actually applied. Drive a
+    /// compressed engine hard, then check the reported reduction against the
+    /// difference the compressor made to the peak.
+    #[test]
+    fn the_meter_reports_the_reduction_the_compressor_applied() {
+        let squash = |p: &SharedParams| {
+            p.seq_playing.set(false);
+            p.master_gain.set(1.0);
+            p.comp_master.on.set(true);
+            p.comp_master.threshold_db.set(-24.0);
+            p.comp_master.ratio.set(8.0);
+            p.comp_master.attack_ms.set(0.1);
+        };
+        let (mut squashed, tx_squashed) = engine_preset(squash);
+        let (mut open, tx_open) = engine_preset(|p| {
+            p.seq_playing.set(false);
+            p.master_gain.set(1.0);
+        });
+        for tx in [&tx_squashed, &tx_open] {
+            tx.push(Event::NoteOn { note: 60, velocity: 1.0 });
+        }
+
+        // Long enough for the attack to settle at the steady-state reduction.
+        let squashed_out = render(&mut squashed, 8_192);
+        let open_out = render(&mut open, 8_192);
+        assert!(peak(&open_out) > 0.0, "the synth never sounded");
+
+        let reported = squashed.params.comp_master_gr.get();
+        assert!(reported > 0.0, "the meter reported no reduction");
+
+        let measured = 20.0 * (peak(&open_out) / peak(&squashed_out)).log10();
+        assert!(
+            (reported - measured).abs() < 3.0,
+            "meter says {reported} dB, the output moved {measured} dB"
+        );
+    }
+
+    /// A bypassed compressor reads zero, so the meter empties rather than
+    /// freezing at whatever it last saw.
+    #[test]
+    fn the_meter_empties_when_the_compressor_is_off() {
+        let (mut engine, tx) = engine_preset(|p| {
+            p.seq_playing.set(false);
+            p.comp_master.on.set(true);
+            p.comp_master.threshold_db.set(-40.0);
+        });
+        tx.push(Event::NoteOn { note: 60, velocity: 1.0 });
+        render(&mut engine, 4_096);
+        assert!(engine.params.comp_master_gr.get() > 0.0, "never compressed");
+
+        engine.params.comp_master.on.set(false);
+        render(&mut engine, 4_096);
+        assert_eq!(engine.params.comp_master_gr.get(), 0.0);
     }
 }

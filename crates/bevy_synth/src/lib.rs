@@ -345,6 +345,10 @@ pub struct SynthTelemetry {
     /// Peak output level since the last frame, `0.0..=1.0`. Drives a meter, or
     /// anything that should pulse with the music.
     pub peak: f32,
+    /// Gain reduction the synth-bus compressor is applying, in positive dB.
+    pub comp_synth_gr: f32,
+    /// Gain reduction the master compressor is applying, in positive dB.
+    pub comp_master_gr: f32,
 }
 
 fn read_telemetry(synth: Res<Synth>, mut telemetry: ResMut<SynthTelemetry>) {
@@ -358,4 +362,8 @@ fn read_telemetry(synth: Res<Synth>, mut telemetry: ResMut<SynthTelemetry>) {
     // `take_peak` resets the meter, so each frame reports the peak since the
     // last one rather than an all-time high that never falls.
     telemetry.peak = synth.params.take_peak();
+    // Plain reads, not `take_*`: these are levels, not accumulators, so
+    // there is nothing to reset.
+    telemetry.comp_synth_gr = synth.params.comp_synth_gr.get();
+    telemetry.comp_master_gr = synth.params.comp_master_gr.get();
 }
