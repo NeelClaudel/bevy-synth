@@ -473,6 +473,24 @@ mod tests {
         assert!(params.pad_mute[3].get());
     }
 
+    /// The bus gains are the mixer, not the patch: they hold the player's
+    /// balance between the synth and the rack. Presets normalise their own
+    /// loudness through `master_gain` and must stop there, the same way they
+    /// keep their hands off `drum_level`.
+    #[test]
+    fn presets_leave_the_bus_gains_alone() {
+        let params = SharedParams::default();
+        params.synth_gain.set(0.3);
+        params.drum_gain.set(1.2);
+
+        for preset in ALL {
+            (preset.apply)(&params);
+        }
+
+        assert_eq!(params.synth_gain.get(), 0.3);
+        assert_eq!(params.drum_gain.get(), 1.2);
+    }
+
     #[test]
     fn effects_do_not_leak_between_presets() {
         let params = SharedParams::from_params(&Params::default());

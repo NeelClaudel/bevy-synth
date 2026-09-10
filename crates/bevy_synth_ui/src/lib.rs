@@ -432,7 +432,17 @@ fn transport(ui: &mut Ui, synth: &Synth, telemetry: &SynthTelemetry, state: &mut
                     .default(0.5)
                     .size(36.0),
                 &synth.params.master_gain,
-            );
+            )
+            .on_hover_text("level of the whole mix, synth and drums together");
+            widgets::knob_param(
+                ui,
+                &KnobSpec::new("Synth", 0.0..=1.5)
+                    .colour(palette::ACCENT)
+                    .default(1.0)
+                    .size(36.0),
+                &synth.params.synth_gain,
+            )
+            .on_hover_text("level of the melody bus alone, under the master");
             widgets::knob_param(
                 ui,
                 &KnobSpec::new("Drive", 0.5..=10.0)
@@ -1267,7 +1277,16 @@ fn drums(ui: &mut Ui, synth: &Synth, telemetry: &SynthTelemetry, state: &mut Syn
                     .size(36.0),
                 &p.drum_level,
             )
-            .on_hover_text("level of the whole rack, after the per-pad levels");
+            .on_hover_text("trim inside the rack, after the per-pad levels");
+            widgets::knob_param(
+                ui,
+                &KnobSpec::new("Gain", 0.0..=1.5)
+                    .colour(palette::DRUM)
+                    .default(1.0)
+                    .size(36.0),
+                &p.drum_gain,
+            )
+            .on_hover_text("level of the drum bus in the mix, under the master");
         });
     });
 }

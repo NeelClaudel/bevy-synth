@@ -315,6 +315,12 @@ pub struct Params {
 
     // --- Output ---
     pub master_gain: f32,
+    /// Level of the melody bus alone, applied after the soft clipper so it
+    /// sets loudness without changing how hard `drive` is saturating.
+    pub synth_gain: f32,
+    /// Level of the drum bus alone, applied where the rack is summed into the
+    /// mix. Independent of `drum_level`, which trims the rack internally.
+    pub drum_gain: f32,
     /// Pre-limiter drive. Above 1.0 pushes the output into the soft clipper for
     /// saturation rather than clean gain.
     pub drive: f32,
@@ -459,6 +465,11 @@ impl Default for Params {
             mod_wheel: 0.0,
 
             master_gain: 0.5,
+            // Unity: the two bus gains are a mixer in front of the existing
+            // sound, not a change to it, so a patch that never touches them
+            // renders exactly as it did before they existed.
+            synth_gain: 1.0,
+            drum_gain: 1.0,
             drive: 1.0,
 
             delay_mix: 0.0,
@@ -581,6 +592,8 @@ pub struct SharedParams {
     pub mod_wheel: AtomicF32,
 
     pub master_gain: AtomicF32,
+    pub synth_gain: AtomicF32,
+    pub drum_gain: AtomicF32,
     pub drive: AtomicF32,
 
     pub delay_mix: AtomicF32,
@@ -742,6 +755,8 @@ impl SharedParams {
             mod_wheel: AtomicF32::new(p.mod_wheel),
 
             master_gain: AtomicF32::new(p.master_gain),
+            synth_gain: AtomicF32::new(p.synth_gain),
+            drum_gain: AtomicF32::new(p.drum_gain),
             drive: AtomicF32::new(p.drive),
 
             delay_mix: AtomicF32::new(p.delay_mix),
@@ -861,6 +876,8 @@ impl SharedParams {
             mod_wheel: self.mod_wheel.get().clamp(0.0, 1.0),
 
             master_gain: self.master_gain.get().clamp(0.0, 2.0),
+            synth_gain: self.synth_gain.get().clamp(0.0, 2.0),
+            drum_gain: self.drum_gain.get().clamp(0.0, 2.0),
             drive: self.drive.get().clamp(0.1, 20.0),
 
             delay_mix: clamp01(self.delay_mix.get()),
@@ -961,6 +978,8 @@ impl SharedParams {
         self.mod_wheel.set(p.mod_wheel);
 
         self.master_gain.set(p.master_gain);
+        self.synth_gain.set(p.synth_gain);
+        self.drum_gain.set(p.drum_gain);
         self.drive.set(p.drive);
 
         self.delay_mix.set(p.delay_mix);
@@ -1115,11 +1134,15 @@ mod tests {
         p.osc1_wave = Waveform::Pulse;
         p.voice_mode = VoiceMode::Mono;
         p.gen_scale = Scale::Dorian;
+        p.synth_gain = 0.6;
+        p.drum_gain = 1.4;
 
         let shared = SharedParams::default();
         shared.apply(&p);
         let back = shared.snapshot();
 
+        assert_eq!(back.synth_gain, 0.6);
+        assert_eq!(back.drum_gain, 1.4);
         assert_eq!(back.cutoff, 3456.0);
         assert_eq!(back.resonance, 0.8);
         assert_eq!(back.osc1_wave, Waveform::Pulse);
@@ -1136,8 +1159,12 @@ mod tests {
         shared.resonance.set(99.0);
         shared.max_voices.set(9999);
         shared.tempo.set(0.0);
+        shared.synth_gain.set(-1.0);
+        shared.drum_gain.set(f32::INFINITY);
 
         let p = shared.snapshot();
+        assert!(p.synth_gain >= 0.0);
+        assert!(p.drum_gain <= 2.0);
         assert!(p.cutoff >= 20.0);
         assert!(p.resonance <= 1.0);
         assert!(p.max_voices <= crate::MAX_VOICES);

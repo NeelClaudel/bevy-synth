@@ -61,6 +61,10 @@ pub struct Engine {
     held: Vec<u8>,
 
     master_gain: Smoothed,
+    /// Per-bus levels, smoothed for the same reason `master_gain` is: a knob
+    /// dragged across a block boundary steps, and a stepped gain zippers.
+    synth_gain: Smoothed,
+    drum_gain: Smoothed,
     /// One-pole state for the output DC blocker.
     dc_x1: f32,
     dc_y1: f32,
@@ -118,6 +122,8 @@ impl Engine {
             age_counter: 1,
             held: Vec::with_capacity(MAX_HELD),
             master_gain: Smoothed::new(snapshot.master_gain, 15.0, control_rate),
+            synth_gain: Smoothed::new(snapshot.synth_gain, 15.0, control_rate),
+            drum_gain: Smoothed::new(snapshot.drum_gain, 15.0, control_rate),
             dc_x1: 0.0,
             dc_y1: 0.0,
             // ~10 Hz corner: removes DC and subsonic rumble without touching
@@ -158,8 +164,13 @@ impl Engine {
         self.lfo.set_sample_rate(sample_rate);
         self.clock.set_sample_rate(sample_rate);
         self.dc_coef = 1.0 - (2.0 * core::f32::consts::PI * 10.0 / sample_rate);
-        self.master_gain
-            .set_time(15.0, sample_rate / BLOCK as f32);
+        for gain in [
+            &mut self.master_gain,
+            &mut self.synth_gain,
+            &mut self.drum_gain,
+        ] {
+            gain.set_time(15.0, sample_rate / BLOCK as f32);
+        }
         self.fx.set_sample_rate(sample_rate);
         self.drums.set_sample_rate(sample_rate);
     }
@@ -247,6 +258,8 @@ impl Engine {
 
         self.lfo.set_rate(params.lfo_rate);
         self.master_gain.set_target(params.master_gain);
+        self.synth_gain.set_target(params.synth_gain);
+        self.drum_gain.set_target(params.drum_gain);
 
         params
     }
@@ -305,6 +318,8 @@ impl Engine {
         }
 
         let gain = self.master_gain.next();
+        let synth_gain = self.synth_gain.next();
+        let drum_gain = self.drum_gain.next();
 
         for i in 0..count {
             // Drive into the soft clipper, then out at master gain. Pushing
@@ -320,8 +335,11 @@ impl Engine {
             let blocked = if blocked.is_finite() { blocked } else { 0.0 };
             self.dc_x1 = driven;
             self.dc_y1 = blocked;
-            left[i] = blocked;
-            right[i] = blocked;
+            // After the clipper, not before it: gain into the clipper changes
+            // how hard the synth is saturating, which is `drive`'s job.
+            let levelled = blocked * synth_gain;
+            left[i] = levelled;
+            right[i] = levelled;
         }
 
         // Drums into the effects only if asked. They are summed after the
@@ -330,8 +348,8 @@ impl Engine {
         if drums_playing && params.drum_to_fx {
             let bus = self.drums.output(count);
             for i in 0..count {
-                left[i] += bus[i];
-                right[i] += bus[i];
+                left[i] += bus[i] * drum_gain;
+                right[i] += bus[i] * drum_gain;
             }
         }
 
@@ -344,8 +362,8 @@ impl Engine {
         if drums_playing && !params.drum_to_fx {
             let bus = self.drums.output(count);
             for i in 0..count {
-                left[i] += bus[i];
-                right[i] += bus[i];
+                left[i] += bus[i] * drum_gain;
+                right[i] += bus[i] * drum_gain;
             }
         }
 
@@ -1490,4 +1508,102 @@ mod tests {
             );
         }
     }
+
+    /// Builds an engine with the params already set, so the gain smoothers
+    /// start *at* the value under test rather than gliding toward it. Setting
+    /// a gain after construction would leave the first ~15 ms ramping down
+    /// from the default, and "silent" would not be true of the whole buffer.
+    fn engine_preset(setup: impl FnOnce(&SharedParams)) -> (Engine, crate::event::Producer) {
+        let params = Arc::new(SharedParams::default());
+        setup(&params);
+        let (tx, rx) = channel(256);
+        (Engine::new(48000.0, params.clone(), rx), tx)
+    }
+
+    /// A drum cell programmed on the downbeat of pad 0, for the tests that
+    /// need the rack to make a noise.
+    fn kick_on_one(tx: &crate::event::Producer) {
+        assert!(tx.push(Event::SetDrumCell {
+            step: 0,
+            pad: 0,
+            cell: Cell {
+                active: true,
+                velocity: 1.0
+            },
+        }));
+    }
+
+    #[test]
+    fn a_zeroed_synth_gain_silences_the_melody() {
+        let (mut engine, tx) = engine_preset(|p| {
+            p.synth_gain.set(0.0);
+            p.tempo.set(140.0);
+            p.gen_density.set(1.0);
+        });
+        tx.push(Event::ClockStart);
+
+        assert_eq!(
+            peak(&render(&mut engine, 48_000)),
+            0.0,
+            "the melody played through a closed synth gain"
+        );
+    }
+
+    /// The other half of the claim: the knob is a melody-bus control, so the
+    /// rack has to be audible with it shut. Without this, a `synth_gain`
+    /// wired into the master would pass the test above and still be wrong.
+    #[test]
+    fn a_zeroed_synth_gain_leaves_the_drums_alone() {
+        let (mut engine, tx) = engine_preset(|p| {
+            p.synth_gain.set(0.0);
+            p.drum_enabled.set(true);
+            p.seq_playing.set(true);
+            p.melody_enabled.set(false);
+        });
+        kick_on_one(&tx);
+
+        assert!(
+            peak(&render(&mut engine, 8_192)) > 0.01,
+            "the synth gain swallowed the drum bus"
+        );
+    }
+
+    /// Both sum sites, not just one: the bus is mixed before the effects when
+    /// `drum_to_fx` is on and after them when it is off, and a gain applied to
+    /// only one branch would leave the rack audible on the other.
+    #[test]
+    fn a_zeroed_drum_gain_silences_the_drums_on_either_routing() {
+        for to_fx in [false, true] {
+            let (mut engine, tx) = engine_preset(|p| {
+                p.drum_gain.set(0.0);
+                p.drum_enabled.set(true);
+                p.seq_playing.set(true);
+                p.melody_enabled.set(false);
+                p.drum_to_fx.set(to_fx);
+            });
+            kick_on_one(&tx);
+
+            assert_eq!(
+                peak(&render(&mut engine, 8_192)),
+                0.0,
+                "the rack played through a closed drum gain (drum_to_fx = {to_fx})"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zeroed_drum_gain_leaves_the_melody_alone() {
+        let (mut engine, tx) = engine_preset(|p| {
+            p.drum_gain.set(0.0);
+            p.tempo.set(140.0);
+            p.gen_density.set(1.0);
+        });
+        tx.push(Event::ClockStart);
+
+        assert!(
+            peak(&render(&mut engine, 48_000)) > 0.02,
+            "the drum gain swallowed the melody"
+        );
+    }
+
 }
