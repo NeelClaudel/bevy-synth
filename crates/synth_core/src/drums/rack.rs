@@ -1,4 +1,4 @@
-//! The rack: eight voices, one grid, one mono bus.
+//! The rack: eight voices, one grid, a stereo bus pair.
 //!
 //! The rack is where a hit becomes a sound. It owns the sequencer and the
 //! voices, applies the per-pad controls the sequencer knows nothing about
@@ -16,11 +16,45 @@ use crate::clock::{Advance, ClockView};
 use crate::params::Params;
 use crate::BLOCK;
 
+/// The rack's outputs for one block.
+///
+/// The send pair exists because per-pad sends cannot be recovered from the
+/// summed dry pair; the kick tap exists so a sidechain detector can follow
+/// one pad. All three are rendered together in the same pass so a voice is
+/// only advanced once.
+#[derive(Clone, Copy)]
+pub struct DrumBuses {
+    pub dry_l: [f32; BLOCK],
+    pub dry_r: [f32; BLOCK],
+    pub send_l: [f32; BLOCK],
+    pub send_r: [f32; BLOCK],
+    /// Pad 0 alone, post-level, pre-pan, mono.
+    pub kick: [f32; BLOCK],
+}
+
+impl DrumBuses {
+    const SILENT: Self = Self {
+        dry_l: [0.0; BLOCK],
+        dry_r: [0.0; BLOCK],
+        send_l: [0.0; BLOCK],
+        send_r: [0.0; BLOCK],
+        kick: [0.0; BLOCK],
+    };
+
+    fn clear(&mut self, frames: usize) {
+        let n = frames.min(BLOCK);
+        self.dry_l[..n].fill(0.0);
+        self.dry_r[..n].fill(0.0);
+        self.send_l[..n].fill(0.0);
+        self.send_r[..n].fill(0.0);
+        self.kick[..n].fill(0.0);
+    }
+}
+
 pub struct DrumRack {
     sequencer: DrumSequencer,
     voices: [DrumVoice; PAD_COUNT],
-    /// Mono scratch. The engine pans it; the rack only sums.
-    buffer: [f32; BLOCK],
+    out: DrumBuses,
     sample_rate: f32,
 }
 
@@ -33,7 +67,7 @@ impl DrumRack {
             voices: core::array::from_fn(|i| {
                 DrumVoice::new(sample_rate, seed ^ (0x9E37_79B9 * (i as u64 + 1)))
             }),
-            buffer: [0.0; BLOCK],
+            out: DrumBuses::SILENT,
             sample_rate: sample_rate.max(1.0),
         }
     }
@@ -57,7 +91,7 @@ impl DrumRack {
         for voice in &mut self.voices {
             voice.silence();
         }
-        self.buffer = [0.0; BLOCK];
+        self.out = DrumBuses::SILENT;
     }
 
     /// The external-clock path. The engine calls this from its MIDI tick
@@ -100,7 +134,7 @@ impl DrumRack {
             for voice in &mut self.voices {
                 voice.silence();
             }
-            self.buffer[..frames].fill(0.0);
+            self.out.clear(frames);
             return false;
         }
 
@@ -110,24 +144,50 @@ impl DrumRack {
         // Nothing struck and nothing ringing: zero the scratch so a stale tail
         // can never be read back, and tell the engine not to bother mixing.
         if self.voices.iter().all(|v| v.is_silent()) {
-            self.buffer[..frames].fill(0.0);
+            self.out.clear(frames);
             return false;
         }
 
+        // `drum_level` is applied after the pads are summed, exactly as the
+        // mono rack did: `(a + b) * level` and `a * level + b * level` are
+        // not the same float, and centre has to match the old value bit for
+        // bit.
         let level = p.drum_level;
-        for slot in self.buffer[..frames].iter_mut() {
-            let mut sum = 0.0;
-            for voice in self.voices.iter_mut() {
-                sum += voice.next();
+        for f in 0..frames {
+            let mut dry_l = 0.0;
+            let mut dry_r = 0.0;
+            let mut send_l = 0.0;
+            let mut send_r = 0.0;
+            let mut kick = 0.0;
+            for (i, voice) in self.voices.iter_mut().enumerate() {
+                let sample = voice.next();
+                if i == 0 {
+                    kick = sample;
+                }
+                // Unity at centre, constant amplitude in the surviving
+                // channel. Equal power would push the extremes 3 dB up.
+                let pan = p.pad_pan[i];
+                let l = sample * (1.0 - pan).min(1.0);
+                let r = sample * (1.0 + pan).min(1.0);
+                dry_l += l;
+                dry_r += r;
+                let send = p.pad_send[i];
+                send_l += l * send;
+                send_r += r * send;
             }
-            *slot = sum * level;
+            self.out.dry_l[f] = dry_l * level;
+            self.out.dry_r[f] = dry_r * level;
+            self.out.send_l[f] = send_l * level;
+            self.out.send_r[f] = send_r * level;
+            self.out.kick[f] = kick * level;
         }
         true
     }
 
-    /// The mono drum bus for the block just rendered.
-    pub fn output(&self, frames: usize) -> &[f32] {
-        &self.buffer[..frames.min(BLOCK)]
+    /// The block just rendered. Valid up to `BLOCK` frames; the engine only
+    /// reads the `count` it asked for.
+    pub fn buses(&self) -> &DrumBuses {
+        &self.out
     }
 
     /// Turn a column of velocities into strikes, applying the per-pad controls
@@ -172,6 +232,20 @@ mod tests {
     use crate::params::{ClockSource, Params};
     use crate::BLOCK;
 
+    /// One block of the kick, taken from the mono rack before the stereo
+    /// rewrite. Centre panning has to land on these numbers exactly, or the
+    /// rewrite changed every existing patch.
+    const MONO_REFERENCE: [f32; 8] = [
+        -0.17237629,
+        0.043552846,
+        0.29023832,
+        -0.06265369,
+        -0.01962061,
+        0.24162598,
+        0.23737402,
+        -0.060975004,
+    ];
+
     fn setup(p: &Params) -> (DrumRack, Clock) {
         let mut c = Clock::new(48_000.0);
         c.set_tempo(p.tempo, p.steps_per_beat);
@@ -179,14 +253,43 @@ mod tests {
         (DrumRack::new(48_000.0, 0x51D), c)
     }
 
+    fn peak_of(buf: &[f32]) -> f32 {
+        buf.iter().fold(0.0f32, |m, s| m.max(s.abs()))
+    }
+
     fn render(r: &mut DrumRack, c: &mut Clock, p: &Params) -> (bool, f32) {
         let adv = c.advance(BLOCK, ClockSource::Internal);
         let sounded = r.render(BLOCK, adv, c.view(), p);
-        let peak = r
-            .output(BLOCK)
-            .iter()
-            .fold(0.0f32, |m, s| m.max(s.abs()));
+        let bus = r.buses();
+        let peak = peak_of(&bus.dry_l).max(peak_of(&bus.dry_r));
         (sounded, peak)
+    }
+
+    /// Renders until the rack makes sound, then returns that block's
+    /// `dry_l` and `dry_r`.
+    fn first_sounding_block(
+        rack: &mut DrumRack,
+        clock: &mut Clock,
+        p: &Params,
+    ) -> ([f32; 8], [f32; 8]) {
+        for _ in 0..200 {
+            let adv = clock.advance(BLOCK, ClockSource::Internal);
+            rack.render(BLOCK, adv, clock.view(), p);
+            let bus = rack.buses();
+            if bus.dry_l.iter().chain(bus.dry_r.iter()).any(|s| *s != 0.0) {
+                let mut l = [0.0f32; 8];
+                let mut r = [0.0f32; 8];
+                l.copy_from_slice(&bus.dry_l[..8]);
+                r.copy_from_slice(&bus.dry_r[..8]);
+                return (l, r);
+            }
+        }
+        panic!("the pad never sounded");
+    }
+
+    fn kick_grid(rack: &mut DrumRack) {
+        rack.sequencer()
+            .set_cell(0, 0, Cell { active: true, velocity: 1.0 });
     }
 
     /// The whole reason the golden vector survives: an empty rack does not
@@ -261,7 +364,7 @@ mod tests {
             }
             // Between step 3 and step 4: past the closed hat's own decay.
             if steps == 4 {
-                let peak = rack.output(BLOCK).iter().fold(0.0f32, |m, s| m.max(s.abs()));
+                let peak = peak_of(&rack.buses().dry_l);
                 choked_tail = choked_tail.max(peak);
             }
         }
@@ -280,7 +383,7 @@ mod tests {
                 steps += 1;
             }
             if steps == 4 {
-                let peak = rack.output(BLOCK).iter().fold(0.0f32, |m, s| m.max(s.abs()));
+                let peak = peak_of(&rack.buses().dry_l);
                 free_tail = free_tail.max(peak);
             }
         }
@@ -428,5 +531,128 @@ mod tests {
             assert!(!sounded);
             assert_eq!(peak, 0.0);
         }
+    }
+
+    /// Spec: `pad_pan = 0.0` yields `l == r`, equal to today's mono value
+    /// exactly.
+    #[test]
+    fn a_centred_pad_reproduces_the_mono_sum() {
+        let p = Params { drum_enabled: true, ..Default::default() };
+        let (mut rack, mut clock) = setup(&p);
+        kick_grid(&mut rack);
+
+        let (l, r) = first_sounding_block(&mut rack, &mut clock, &p);
+        assert_eq!(l, r, "centre is not centred");
+        assert_eq!(l, MONO_REFERENCE, "centre no longer matches the mono rack");
+    }
+
+    /// Spec: `pad_pan = -1.0` yields `r == 0.0` and `l` unchanged. Constant
+    /// amplitude in the surviving channel is the deliberate trade-off.
+    #[test]
+    fn a_hard_left_pad_empties_the_right_channel_and_leaves_the_left_alone() {
+        let mut p = Params { drum_enabled: true, ..Default::default() };
+        p.pad_pan[0] = -1.0;
+        let (mut rack, mut clock) = setup(&p);
+        kick_grid(&mut rack);
+
+        let (l, r) = first_sounding_block(&mut rack, &mut clock, &p);
+        assert_eq!(r, [0.0; 8], "the right channel is not empty");
+        assert_eq!(l, MONO_REFERENCE, "hard left changed the left channel");
+    }
+
+    /// The mirror image, so a sign slip in the pan law cannot pass.
+    #[test]
+    fn a_hard_right_pad_empties_the_left_channel() {
+        let mut p = Params { drum_enabled: true, ..Default::default() };
+        p.pad_pan[0] = 1.0;
+        let (mut rack, mut clock) = setup(&p);
+        kick_grid(&mut rack);
+
+        let (l, r) = first_sounding_block(&mut rack, &mut clock, &p);
+        assert_eq!(l, [0.0; 8], "the left channel is not empty");
+        assert_eq!(r, MONO_REFERENCE, "hard right changed the right channel");
+    }
+
+    /// At the default `pad_send = 1.0` the send pair is the dry pair. The
+    /// engine scales it by `drum_send`, which defaults to 0.0, so this is
+    /// what makes `drum_send` behave like the old bool.
+    #[test]
+    fn the_send_pair_matches_the_dry_pair_at_full_send() {
+        let p = Params { drum_enabled: true, ..Default::default() };
+        let (mut rack, mut clock) = setup(&p);
+        kick_grid(&mut rack);
+
+        for _ in 0..200 {
+            let adv = clock.advance(BLOCK, ClockSource::Internal);
+            rack.render(BLOCK, adv, clock.view(), &p);
+        }
+        let bus = rack.buses();
+        assert_eq!(bus.send_l, bus.dry_l);
+        assert_eq!(bus.send_r, bus.dry_r);
+    }
+
+    /// Spec: per-pad send differences have to be rendered, not derived — the
+    /// summed output cannot tell you which pad contributed what.
+    #[test]
+    fn a_pad_with_its_send_closed_stays_out_of_the_send_pair() {
+        let mut p = Params { drum_enabled: true, ..Default::default() };
+        p.pad_send[0] = 0.0;
+        let (mut rack, mut clock) = setup(&p);
+        kick_grid(&mut rack);
+
+        let mut dry_peak = 0.0f32;
+        let mut send_peak = 0.0f32;
+        for _ in 0..200 {
+            let adv = clock.advance(BLOCK, ClockSource::Internal);
+            rack.render(BLOCK, adv, clock.view(), &p);
+            let bus = rack.buses();
+            dry_peak = dry_peak.max(peak_of(&bus.dry_l));
+            send_peak = send_peak.max(peak_of(&bus.send_l));
+        }
+        assert!(dry_peak > 0.05, "the kick never reached the dry bus");
+        assert_eq!(send_peak, 0.0, "a closed send still leaked");
+    }
+
+    /// The detector tap follows pad 0 alone, post-level and pre-pan, so a
+    /// hard-panned kick still ducks the same amount.
+    #[test]
+    fn the_kick_tap_ignores_pan() {
+        let mut p = Params { drum_enabled: true, ..Default::default() };
+        p.pad_pan[0] = -1.0;
+        let (mut rack, mut clock) = setup(&p);
+        kick_grid(&mut rack);
+
+        let mut kick_peak = 0.0f32;
+        for _ in 0..200 {
+            let adv = clock.advance(BLOCK, ClockSource::Internal);
+            rack.render(BLOCK, adv, clock.view(), &p);
+            kick_peak = kick_peak.max(peak_of(&rack.buses().kick));
+        }
+        assert!(kick_peak > 0.05, "the detector tap is silent: {kick_peak}");
+    }
+
+    /// A disabled rack must leave every buffer clean, including the three
+    /// the engine does not read yet — a stale send would ring into the
+    /// return the moment Task 4 wires it up.
+    #[test]
+    fn disabling_clears_every_buffer() {
+        let mut p = Params { drum_enabled: true, ..Default::default() };
+        let (mut rack, mut clock) = setup(&p);
+        kick_grid(&mut rack);
+        for _ in 0..200 {
+            let adv = clock.advance(BLOCK, ClockSource::Internal);
+            rack.render(BLOCK, adv, clock.view(), &p);
+        }
+
+        p.drum_enabled = false;
+        let adv = clock.advance(BLOCK, ClockSource::Internal);
+        rack.render(BLOCK, adv, clock.view(), &p);
+
+        let bus = rack.buses();
+        assert_eq!(bus.dry_l, [0.0; BLOCK]);
+        assert_eq!(bus.dry_r, [0.0; BLOCK]);
+        assert_eq!(bus.send_l, [0.0; BLOCK]);
+        assert_eq!(bus.send_r, [0.0; BLOCK]);
+        assert_eq!(bus.kick, [0.0; BLOCK]);
     }
 }

@@ -346,10 +346,10 @@ impl Engine {
         // drive stage and the DC blocker either way: a kick through the soft
         // clipper at drive 3.0 is a different instrument, and not a better one.
         if drums_playing && params.drum_to_fx {
-            let bus = self.drums.output(count);
+            let bus = self.drums.buses();
             for i in 0..count {
-                left[i] += bus[i] * drum_gain;
-                right[i] += bus[i] * drum_gain;
+                left[i] += bus.dry_l[i] * drum_gain;
+                right[i] += bus.dry_r[i] * drum_gain;
             }
         }
 
@@ -360,10 +360,10 @@ impl Engine {
             .process_block(&mut left[..count], &mut right[..count], params, tempo);
 
         if drums_playing && !params.drum_to_fx {
-            let bus = self.drums.output(count);
+            let bus = self.drums.buses();
             for i in 0..count {
-                left[i] += bus[i] * drum_gain;
-                right[i] += bus[i] * drum_gain;
+                left[i] += bus.dry_l[i] * drum_gain;
+                right[i] += bus.dry_r[i] * drum_gain;
             }
         }
 
