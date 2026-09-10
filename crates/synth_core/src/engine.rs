@@ -204,9 +204,12 @@ impl Engine {
             let mut right = [0.0f32; BLOCK];
             self.render_chunk(&mut left[..count], &mut right[..count], &params);
             for (i, sample) in out[done..done + count].iter_mut().enumerate() {
-                // Sum to mono. When the effects are off the two channels are
-                // bit-identical, and `(x + x) * 0.5` is exact in IEEE-754, so
-                // this path does not disturb a dry signal.
+                // Sum to mono. At the default centred pan the two channels
+                // are still bit-identical, and `(x + x) * 0.5` is exact in
+                // IEEE-754, so a dry, centred patch passes through untouched.
+                // A panned pad makes the channels diverge, and past that
+                // point this is an ordinary lossy downmix, not a lossless
+                // one.
                 *sample = (left[i] + right[i]) * 0.5;
             }
             done += count;
@@ -860,7 +863,7 @@ mod tests {
     use super::*;
     use crate::drums::Cell;
     use crate::event::channel;
-    use crate::params::{ClockSource, SharedParams};
+    use crate::params::{ClockSource, CompressorParams, SharedParams};
 
     fn engine() -> (Engine, crate::event::Producer, Arc<SharedParams>) {
         let params = Arc::new(SharedParams::default());
@@ -1662,6 +1665,29 @@ mod tests {
         );
     }
 
+    /// The seam between the rack and the engine, not the rack itself: Task 3's
+    /// pan tests (`a_hard_left_pad_empties_the_right_channel_and_leaves_the_left_alone`
+    /// in `drums/rack.rs`) pin `DrumBuses` in isolation, but nothing checked
+    /// that the rack's stereo pair actually reaches
+    /// `process_stereo_interleaved`'s output as a stereo pair rather than,
+    /// say, both channels reading from `dry_l`.
+    #[test]
+    fn a_hard_left_pad_stays_stereo_at_the_engine_output() {
+        let (mut engine, tx) = engine_preset(|p| {
+            p.melody_enabled.set(false);
+            p.drum_enabled.set(true);
+            p.pad_pan[0].set(-1.0);
+        });
+        kick_on_one(&tx);
+        tx.push(Event::ClockStart);
+
+        let out = render_stereo(&mut engine, 8192);
+        let l: Vec<f32> = out.iter().step_by(2).copied().collect();
+        let r: Vec<f32> = out.iter().skip(1).step_by(2).copied().collect();
+        assert_eq!(peak(&r), 0.0, "the hard-left pad leaked into the right channel");
+        assert!(peak(&l) > 0.0, "the hard-left pad silenced the left channel too");
+    }
+
     /// The claim the golden vector rests on: with both mixes at zero the
     /// return hands back exactly what it was sent, so `chain(send) - send`
     /// is `0.0` and the send knob is inaudible. Bit-identical, not close.
@@ -1928,6 +1954,106 @@ mod tests {
         );
     }
 
+    /// Nothing pinned the synth compressor ahead of the send tap: every test
+    /// above that exercises the return leaves `comp_synth.on` at its default
+    /// `false`, where a bypassed compressor is a pass-through and the
+    /// ordering cannot matter. Build the expected chain by hand -- compress
+    /// first, then feed the compressed signal to a fresh `FxChain`, exactly
+    /// like `a_full_send_reproduces_the_insert_it_replaced` builds its
+    /// reference -- and check the engine's actual output matches it. Swap
+    /// the compressor and the send tap and the engine would feed the chain
+    /// the raw signal instead, so it would no longer match this reference.
+    #[test]
+    fn the_synth_compressor_sits_ahead_of_the_send_tap() {
+        // The pre-compression dry signal: master wide open, nothing else
+        // running.
+        let (mut dry_engine, tx_dry) = engine_preset(|p| {
+            p.seq_playing.set(false);
+            p.master_gain.set(1.0);
+        });
+        tx_dry.push(Event::NoteOn {
+            note: 60,
+            velocity: 0.8,
+        });
+        let dry = render_stereo(&mut dry_engine, 4096);
+        let mut comp_l: Vec<f32> = dry.iter().step_by(2).copied().collect();
+        let mut comp_r: Vec<f32> = dry.iter().skip(1).step_by(2).copied().collect();
+
+        // Compress it by hand, with a punishing enough threshold that the
+        // ordering is unmistakable, chunked by `BLOCK` the same way the
+        // engine calls it.
+        let comp_params = CompressorParams {
+            on: true,
+            threshold_db: -36.0,
+            ratio: 8.0,
+            attack_ms: 0.1,
+            release_ms: 50.0,
+            makeup_db: 0.0,
+            sidechain: SidechainSource::Off,
+        };
+        let mut reference_comp = Compressor::new(48_000.0);
+        for (cl, cr) in comp_l.chunks_mut(BLOCK).zip(comp_r.chunks_mut(BLOCK)) {
+            reference_comp.process(cl, cr, None, &comp_params);
+        }
+
+        // Sanity: the compressor actually did something, or this proves
+        // nothing.
+        let moved = comp_l
+            .iter()
+            .zip(dry.iter().step_by(2))
+            .fold(0.0f32, |a, (c, d)| a.max((c - d).abs()));
+        assert!(
+            moved > 1.0e-3,
+            "the compressor was inaudible; the test is vacuous: {moved:e}"
+        );
+
+        // Feed the compressed signal to a fresh chain. At `synth_send = 1.0`
+        // this is exactly what the send tap hands the return if the
+        // compressor really does sit ahead of it; the dry term the engine
+        // carries forward is that same compressed signal, so `dry + (ret -
+        // send)` collapses to `ret`, the same identity
+        // `a_full_send_reproduces_the_insert_it_replaced` uses.
+        let mut ret_l = comp_l.clone();
+        let mut ret_r = comp_r.clone();
+        let mut chain = FxChain::new(48_000.0);
+        let reference_params = Params {
+            delay_mix: 0.5,
+            delay_time: 0.01,
+            reverb_mix: 0.5,
+            ..Default::default()
+        };
+        for (cl, cr) in ret_l.chunks_mut(BLOCK).zip(ret_r.chunks_mut(BLOCK)) {
+            chain.process_block(cl, cr, &reference_params, reference_params.tempo);
+        }
+
+        let (mut wet_engine, tx_wet) = engine_preset(|p| {
+            p.seq_playing.set(false);
+            p.master_gain.set(1.0);
+            p.synth_send.set(1.0);
+            p.delay_mix.set(0.5);
+            p.delay_time.set(0.01);
+            p.reverb_mix.set(0.5);
+            p.comp_synth.on.set(true);
+            p.comp_synth.threshold_db.set(-36.0);
+            p.comp_synth.ratio.set(8.0);
+            p.comp_synth.attack_ms.set(0.1);
+            p.comp_synth.release_ms.set(50.0);
+        });
+        tx_wet.push(Event::NoteOn {
+            note: 60,
+            velocity: 0.8,
+        });
+        let wet = render_stereo(&mut wet_engine, 4096);
+
+        for (i, sample) in wet.iter().enumerate() {
+            let want = if i % 2 == 0 { ret_l[i / 2] } else { ret_r[i / 2] };
+            assert!(
+                (sample - want).abs() < 1.0e-6,
+                "sample {i}: return {sample} vs compressed-then-chained reference {want}"
+            );
+        }
+    }
+
     /// The meter has to agree with the gain actually applied. Drive a
     /// compressed engine hard, then check the reported reduction against the
     /// difference the compressor made to the peak.
@@ -1956,6 +2082,44 @@ mod tests {
         assert!(peak(&open_out) > 0.0, "the synth never sounded");
 
         let reported = squashed.params.comp_master_gr.get();
+        assert!(reported > 0.0, "the meter reported no reduction");
+
+        let measured = 20.0 * (peak(&open_out) / peak(&squashed_out)).log10();
+        assert!(
+            (reported - measured).abs() < 3.0,
+            "meter says {reported} dB, the output moved {measured} dB"
+        );
+    }
+
+    /// The near-copy of the above for the synth bus: `comp_synth_gr` is
+    /// written in `publish_telemetry` but nothing reads it, so a broken
+    /// publish (or one that always writes `0.0`) would survive the suite
+    /// forever and ship as a permanently dead meter in the UI.
+    #[test]
+    fn the_synth_meter_reports_the_reduction_the_compressor_applied() {
+        let squash = |p: &SharedParams| {
+            p.seq_playing.set(false);
+            p.master_gain.set(1.0);
+            p.comp_synth.on.set(true);
+            p.comp_synth.threshold_db.set(-24.0);
+            p.comp_synth.ratio.set(8.0);
+            p.comp_synth.attack_ms.set(0.1);
+        };
+        let (mut squashed, tx_squashed) = engine_preset(squash);
+        let (mut open, tx_open) = engine_preset(|p| {
+            p.seq_playing.set(false);
+            p.master_gain.set(1.0);
+        });
+        for tx in [&tx_squashed, &tx_open] {
+            tx.push(Event::NoteOn { note: 60, velocity: 1.0 });
+        }
+
+        // Long enough for the attack to settle at the steady-state reduction.
+        let squashed_out = render(&mut squashed, 8_192);
+        let open_out = render(&mut open, 8_192);
+        assert!(peak(&open_out) > 0.0, "the synth never sounded");
+
+        let reported = squashed.params.comp_synth_gr.get();
         assert!(reported > 0.0, "the meter reported no reduction");
 
         let measured = 20.0 * (peak(&open_out) / peak(&squashed_out)).log10();
