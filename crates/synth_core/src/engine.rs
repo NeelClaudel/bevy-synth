@@ -2398,6 +2398,58 @@ mod tests {
     }
 
     #[test]
+    fn bass_send_taps_the_compressed_bass_not_the_dry_signal() {
+        // A bypassed compressor is bit-exact -- `on: false` never touches the
+        // buffers -- so with the insert off, the tap's position on either
+        // side of it is unobservable. Only a compressor that is actually
+        // crushing can tell the two positions apart, which is why this test
+        // (unlike `bass_send_feeds_the_return_and_zero_does_not` above) needs
+        // one.
+        let crushing = CompressorParams {
+            on: true,
+            threshold_db: -50.0,
+            ratio: 20.0,
+            ..CompressorParams::default()
+        };
+        let base = Params {
+            bass_enabled: true,
+            melody_enabled: false,
+            drum_enabled: false,
+            seq_playing: true,
+            reverb_mix: 1.0,
+            bass_gain: 0.4,
+            ..Params::default()
+        };
+
+        // Four fresh engines, one per measurement, for the reason
+        // `bass_send_feeds_the_return_and_zero_does_not` gives above: the
+        // bass sequencer keeps advancing, so reusing an engine would compare
+        // different slices of the generative pattern instead of the same
+        // notes with and without a tail.
+        //
+        // A plain fn, not a closure: a closure capturing `base` by struct
+        // update here trips a rustc MIR bug on `Params`'s const-generic
+        // `pad_mute` array.
+        fn measure(base: Params, bass_send: f32, comp_bass: CompressorParams) -> f32 {
+            let p = Params { bass_send, comp_bass, ..base };
+            let shared = std::sync::Arc::new(SharedParams::from_params(&p));
+            let (_tx, rx) = crate::event::channel(64);
+            let mut engine = Engine::new(48_000.0, shared, rx);
+            engine_peak(&mut engine, 800)
+        }
+
+        let delta_off = measure(base, 1.0, CompressorParams::default())
+            - measure(base, 0.0, CompressorParams::default());
+        let delta_on = measure(base, 1.0, crushing) - measure(base, 0.0, crushing);
+
+        assert!(
+            delta_on < delta_off * 0.5,
+            "the send should carry the compressed tail, not the dry one: \
+             delta_off={delta_off}, delta_on={delta_on}"
+        );
+    }
+
+    #[test]
     fn comp_bass_reports_the_reduction_it_applies() {
         let p = Params {
             bass_enabled: true,
