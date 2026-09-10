@@ -194,10 +194,10 @@ impl BassVoice {
             // the same musical distance from 80 Hz as it does from 800.
             // `base_cutoff` and `env_mod` are already finite (see above) and
             // `env` never leaves `0.0..=1.0`, so `octaves.exp2()` cannot be
-            // NaN either -- `clamp` is safe here too. `accent_octaves` is at
-            // most 1.5 (when `accent_amount` is 1.0), and `accent_depth` at
-            // most 2.0, so the product `env_mod * accent_depth` cannot overflow
-            // the cutoff's clamp.
+            // NaN either -- `clamp` is safe here too. `env_mod` already has
+            // `accent_depth` folded into it above, so it caps at 12 rather
+            // than 6, and `accent_octaves` adds at most 1.5 on top: 13.5
+            // octaves, nowhere near overflowing the cutoff's clamp.
             let octaves = env_mod * env + accent_octaves;
             let cutoff = (base_cutoff * octaves.exp2()).clamp(20.0, 20_000.0);
             self.filter.set_params(cutoff, resonance);
