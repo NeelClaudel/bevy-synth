@@ -99,6 +99,7 @@ pub struct Engine {
     last_voice_mode: VoiceMode,
     last_melody_enabled: bool,
     last_regenerate: u32,
+    last_bass_regenerate: u32,
     last_pattern_request: u32,
     peak: f32,
 }
@@ -166,6 +167,7 @@ impl Engine {
             last_voice_mode: snapshot.voice_mode,
             last_melody_enabled: snapshot.melody_enabled,
             last_regenerate: 0,
+            last_bass_regenerate: 0,
             last_pattern_request: 0,
             peak: 0.0,
         };
@@ -630,6 +632,11 @@ impl Engine {
                     self.publish_pattern();
                 }
                 Event::Regenerate => self.regenerate(params),
+                Event::SetBassStep { index, step } => {
+                    self.bass_seq.set_step(index as usize, step);
+                    self.publish_bass_pattern();
+                }
+                Event::RegenerateBass => self.regenerate_bass(params),
                 Event::SetDrumCell { step, pad, cell } => {
                     // No publish here: `set_cell` raises the changed flag and
                     // `render_chunk` publishes once per block, so a burst of
@@ -650,6 +657,17 @@ impl Engine {
         if requested != self.last_regenerate {
             self.last_regenerate = requested;
             self.regenerate(params);
+        }
+
+        // Same idea for the bass line: the control side can ask for a new one
+        // by bumping its own counter, independent of the lead's.
+        let requested = self
+            .params
+            .bass_regenerate
+            .load(core::sync::atomic::Ordering::Relaxed);
+        if requested != self.last_bass_regenerate {
+            self.last_bass_regenerate = requested;
+            self.regenerate_bass(params);
         }
 
         // A saved pattern is loaded the same way, by counter. It is too big to
@@ -697,6 +715,15 @@ impl Engine {
         self.sequencer
             .regenerate(&GenerativeSettings::from_params(params));
         self.publish_pattern();
+    }
+
+    fn regenerate_bass(&mut self, params: &Params) {
+        self.bass_seq.set_seed(
+            self.params.bass_gen_seed.load(core::sync::atomic::Ordering::Relaxed),
+        );
+        self.bass_seq
+            .regenerate(&GenerativeSettings::for_bass(params));
+        self.publish_bass_pattern();
     }
 
     /// Copies the pattern into the shared mirror so the control side can show
@@ -877,6 +904,7 @@ impl Engine {
             // Same reasoning as the drums: `Panic` and a voice-mode switch
             // both have to be able to stop everything, and the bass envelope
             // sustains at 1.0 forever with nothing else to cut it.
+            let _ = self.bass_seq.release_all();
             self.bass.silence();
         }
     }
@@ -2538,5 +2566,93 @@ mod tests {
             0,
             "bass sequencer should be back at step 0"
         );
+    }
+
+    #[test]
+    fn editing_a_bass_step_leaves_the_lead_alone() {
+        let p = Params { bass_enabled: true, ..Params::default() };
+        let shared = std::sync::Arc::new(SharedParams::from_params(&p));
+        let (tx, rx) = crate::event::channel(64);
+        let mut engine = Engine::new(48_000.0, shared.clone(), rx);
+        render_stereo(&mut engine, BLOCK);
+
+        let lead_before = shared.read_step(2);
+        assert!(tx.push(Event::SetBassStep {
+            index: 2,
+            step: crate::sequencer::Step {
+                active: true, note: 31, velocity: 0.7, accent: true, slide: true,
+            },
+        }));
+        render_stereo(&mut engine, BLOCK);
+
+        assert_eq!(shared.read_bass_step(2).note, 31);
+        assert!(shared.read_bass_step(2).slide);
+        assert_eq!(shared.read_step(2), lead_before, "the lead must be untouched");
+    }
+
+    #[test]
+    fn regenerating_one_line_leaves_the_other_alone() {
+        let p = Params { bass_enabled: true, ..Params::default() };
+        let shared = std::sync::Arc::new(SharedParams::from_params(&p));
+        let (tx, rx) = crate::event::channel(64);
+        let mut engine = Engine::new(48_000.0, shared.clone(), rx);
+        render_stereo(&mut engine, BLOCK);
+
+        let lead: Vec<u8> = shared.read_pattern().iter().map(|s| s.note).collect();
+        let bass: Vec<u8> = shared.read_bass_pattern().iter().map(|s| s.note).collect();
+
+        shared.bass_gen_seed.store(0xFACE_0001, core::sync::atomic::Ordering::Relaxed);
+        assert!(tx.push(Event::RegenerateBass));
+        render_stereo(&mut engine, BLOCK);
+
+        let lead_after: Vec<u8> = shared.read_pattern().iter().map(|s| s.note).collect();
+        let bass_after: Vec<u8> = shared.read_bass_pattern().iter().map(|s| s.note).collect();
+        assert_eq!(lead, lead_after, "regenerating the bass must not touch the lead");
+        assert_ne!(bass, bass_after, "and must actually write a new bass line");
+    }
+
+    /// `melody_enabled` defaults to `true`, so isolate the bass the same way
+    /// the sibling tests above do (`clock_stop_silences_a_gated_bass_note` and
+    /// friends) — otherwise a still-ringing lead voice, on its own 250 ms
+    /// release, would fail this on the lead's account rather than the
+    /// bass's.
+    #[test]
+    fn stopping_the_transport_silences_the_bass() {
+        let p = Params {
+            bass_enabled: true,
+            melody_enabled: false,
+            drum_enabled: false,
+            seq_playing: true,
+            ..Params::default()
+        };
+        let shared = std::sync::Arc::new(SharedParams::from_params(&p));
+        let (tx, rx) = crate::event::channel(64);
+        let mut engine = Engine::new(48_000.0, shared.clone(), rx);
+        assert!(engine_peak(&mut engine, 600) > 0.001, "playing");
+
+        assert!(tx.push(Event::ClockStop));
+        render_stereo(&mut engine, BLOCK);
+        // Past the bass amp envelope's release.
+        assert!(engine_peak(&mut engine, 200) < 1e-6, "stopped means silent");
+    }
+
+    /// Same isolation as above, and for the same reason.
+    #[test]
+    fn panic_silences_the_bass() {
+        let p = Params {
+            bass_enabled: true,
+            melody_enabled: false,
+            drum_enabled: false,
+            seq_playing: true,
+            ..Params::default()
+        };
+        let shared = std::sync::Arc::new(SharedParams::from_params(&p));
+        let (tx, rx) = crate::event::channel(64);
+        let mut engine = Engine::new(48_000.0, shared.clone(), rx);
+        engine_peak(&mut engine, 600);
+        shared.seq_playing.set(false);
+        assert!(tx.push(Event::Panic));
+        render_stereo(&mut engine, BLOCK);
+        assert!(engine_peak(&mut engine, 100) < 1e-6, "panic cuts everything");
     }
 }

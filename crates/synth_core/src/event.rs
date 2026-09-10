@@ -50,6 +50,15 @@ pub enum Event {
     /// Throws away the current pattern and generates a new one.
     Regenerate,
 
+    /// Overwrites one step of the bass pattern.
+    ///
+    /// A separate variant rather than a channel field on `SetStep`: additive,
+    /// no existing call site changes, and it is the same size as the variant
+    /// that already sets the queue's slot size, so the queue does not grow.
+    SetBassStep { index: u8, step: Step },
+    /// Writes a fresh bass line from the current `bass_gen_*` parameters.
+    RegenerateBass,
+
     /// Set one cell of the drum grid.
     ///
     /// Small enough to travel by value: `Cell` is a `bool` and an `f32`, so

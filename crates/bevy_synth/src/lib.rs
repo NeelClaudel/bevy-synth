@@ -266,6 +266,60 @@ impl Synth {
         self.set_step(index, step)
     }
 
+    /// The bass pattern, as the audio thread last published it.
+    ///
+    /// Same contract as [`Synth::pattern`]: a copy taken from a lock-free
+    /// mirror, so it never blocks and never shows a half-written step.
+    pub fn bass_pattern(&self) -> synth_core::Pattern {
+        self.params.read_bass_pattern()
+    }
+
+    /// Overwrites one step of the bass pattern.
+    pub fn set_bass_step(&self, index: usize, step: synth_core::Step) -> bool {
+        if index > u8::MAX as usize {
+            return false;
+        }
+        self.send(Event::SetBassStep {
+            index: index as u8,
+            step,
+        })
+    }
+
+    /// Turns one bass step on or off, keeping its note, velocity and flags.
+    pub fn toggle_bass_step(&self, index: usize) -> bool {
+        let mut step = self.params.read_bass_step(index);
+        step.active = !step.active;
+        self.set_bass_step(index, step)
+    }
+
+    /// Turns the tie on one bass step on or off.
+    pub fn toggle_bass_slide(&self, index: usize) -> bool {
+        let mut step = self.params.read_bass_step(index);
+        step.slide = !step.slide;
+        self.set_bass_step(index, step)
+    }
+
+    /// Turns the accent on one bass step on or off.
+    pub fn toggle_bass_accent(&self, index: usize) -> bool {
+        let mut step = self.params.read_bass_step(index);
+        step.accent = !step.accent;
+        self.set_bass_step(index, step)
+    }
+
+    /// Writes a new bass line from the current `bass_gen_*` parameters.
+    pub fn regenerate_bass(&self) {
+        self.params.regenerate_bass();
+    }
+
+    /// Sets the bass seed and immediately regenerates, so a given seed always
+    /// yields the same line.
+    pub fn regenerate_bass_with_seed(&self, seed: u64) {
+        self.params
+            .bass_gen_seed
+            .store(seed, std::sync::atomic::Ordering::Relaxed);
+        self.params.regenerate_bass();
+    }
+
     /// The drum grid, as the audio thread last published it.
     ///
     /// Same contract as [`Synth::pattern`]: a copy taken from a lock-free
