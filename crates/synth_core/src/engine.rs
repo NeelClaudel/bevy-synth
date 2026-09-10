@@ -19,7 +19,7 @@ use crate::event::{Consumer, Event};
 use crate::fx::{Compressor, FxChain};
 use crate::lfo::Lfo;
 use crate::params::{ClockSource, Params, SharedParams, SidechainSource, Smoothed, VoiceMode};
-use crate::sequencer::{GenerativeSettings, Sequencer, MAX_STEPS};
+use crate::sequencer::{GenerativeSettings, SeqSettings, Sequencer, MAX_STEPS};
 use crate::voice::Voice;
 use crate::BLOCK;
 
@@ -291,7 +291,9 @@ impl Engine {
         let adv = self.clock.advance(count, params.clock_source);
         let view = self.clock.view();
 
-        let seq = self.sequencer.advance(count, adv, view, params);
+        let seq = self
+            .sequencer
+            .advance(count, adv, view, &SeqSettings::from_params(params));
         if self.sequencer.take_pattern_changed() {
             // The pattern brought its own length, so the knob has to follow it
             // or the next block's reconcile would cut the melody short.
@@ -484,7 +486,11 @@ impl Engine {
                     let ticked = params.clock_source == ClockSource::ExternalMidi
                         && self.clock.is_running()
                         && self.clock.on_midi_tick(params.steps_per_beat);
-                    let seq = self.sequencer.on_midi_tick(ticked, self.clock.view(), params);
+                    let seq = self.sequencer.on_midi_tick(
+                        ticked,
+                        self.clock.view(),
+                        &SeqSettings::from_params(params),
+                    );
                     // Gated exactly as `render_chunk` gates the same pair. The
                     // sequencer still steps while muted — a mute stops the
                     // events, not the playhead — but nothing it produces
@@ -1054,6 +1060,7 @@ mod tests {
                 note: 12 + i as u8,
                 velocity: 1.0,
                 accent: false,
+                slide: false,
             };
         }
         params.queue_pattern(&Pattern::new(steps, 8));
@@ -1388,6 +1395,7 @@ mod tests {
             note: 42,
             velocity: 1.0,
             accent: false,
+            slide: false,
         };
         tx.push(Event::SetStep { index: 3, step });
         render(&mut e, BLOCK);

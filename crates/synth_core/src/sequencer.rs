@@ -38,9 +38,12 @@ pub struct Step {
     pub active: bool,
     pub note: u8,
     pub velocity: f32,
-    /// Marks a step the generator treated as a downbeat. Useful for driving
-    /// visuals in time with the music.
+    /// Downbeat marker for the lead's visuals; audible on the bass channel,
+    /// where it drives cutoff and level.
     pub accent: bool,
+    /// Ties this step to the one before it: the bass glides into it without
+    /// retriggering. The lead ignores it.
+    pub slide: bool,
 }
 
 impl Default for Step {
@@ -50,6 +53,7 @@ impl Default for Step {
             note: 60,
             velocity: 0.8,
             accent: false,
+            slide: false,
         }
     }
 }
@@ -129,6 +133,34 @@ impl GenerativeSettings {
     }
 }
 
+/// The three per-line settings the sequencer used to read straight out of the
+/// global parameter block.
+///
+/// The engine runs two sequencers — the lead and the bass — off one clock.
+/// Reading `Params` inside `advance` would hand both the same length, swing
+/// and gate, which is precisely the coupling a second line exists to avoid.
+/// Passing a small block instead lets each caller choose.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SeqSettings {
+    /// Loop length in steps. Clamped to `1..=MAX_STEPS` by the reader.
+    pub length: usize,
+    /// Delay on every second step, as a fraction of a step.
+    pub swing: f32,
+    /// Note length, as a fraction of a step.
+    pub gate: f32,
+}
+
+impl SeqSettings {
+    /// The lead's settings.
+    pub fn from_params(p: &Params) -> Self {
+        Self {
+            length: p.seq_length,
+            swing: p.seq_swing,
+            gate: p.seq_gate,
+        }
+    }
+}
+
 /// What the sequencer wants the voice allocator to do this block.
 ///
 /// At most one of each: a block is under a millisecond, and two steps cannot
@@ -140,6 +172,10 @@ pub struct SeqOutput {
     /// True on the block where the sequencer moved to a new step, whether or
     /// not that step sounded. Good for syncing animation.
     pub stepped: bool,
+    /// Whether the note in `note_on` came from an accented step.
+    pub accent: bool,
+    /// Whether the note in `note_on` is tied to the note before it.
+    pub slide: bool,
 }
 
 /// A note waiting out its swing delay.
@@ -147,6 +183,8 @@ pub struct SeqOutput {
 struct Pending {
     note: u8,
     velocity: f32,
+    accent: bool,
+    slide: bool,
     samples_remaining: f32,
 }
 
@@ -327,6 +365,7 @@ impl Sequencer {
                 note,
                 velocity,
                 accent: strong,
+                slide: false,
             };
         }
     }
@@ -341,14 +380,14 @@ impl Sequencer {
         samples: usize,
         adv: Advance,
         clock: ClockView,
-        p: &Params,
+        s: &SeqSettings,
     ) -> SeqOutput {
         let mut out = SeqOutput::default();
 
         // Only when the knob actually moves. Comparing against our own length
         // instead would fight a loaded pattern, whose length comes from the
         // pattern rather than from this block's snapshot of the parameters.
-        let requested_length = p.seq_length.clamp(1, MAX_STEPS);
+        let requested_length = s.length.clamp(1, MAX_STEPS);
         if requested_length != self.last_length_param {
             self.last_length_param = requested_length;
             self.length = requested_length;
@@ -386,12 +425,20 @@ impl Sequencer {
             pending.samples_remaining -= samples_f;
             if pending.samples_remaining <= 0.0 {
                 let pending = self.pending.take().expect("just checked");
-                self.trigger(pending.note, pending.velocity, p, clock, &mut out);
+                self.trigger(
+                    pending.note,
+                    pending.velocity,
+                    pending.accent,
+                    pending.slide,
+                    s,
+                    clock,
+                    &mut out,
+                );
             }
         }
 
         for _ in 0..adv.steps {
-            self.step(p, clock, &mut out);
+            self.step(s, clock, &mut out);
         }
 
         out
@@ -401,16 +448,16 @@ impl Sequencer {
     ///
     /// Whether the tick lands on a step is the engine's decision — it owns the
     /// clock and the clock source — so the answer arrives as an argument.
-    pub fn on_midi_tick(&mut self, ticked: bool, clock: ClockView, p: &Params) -> SeqOutput {
+    pub fn on_midi_tick(&mut self, ticked: bool, clock: ClockView, s: &SeqSettings) -> SeqOutput {
         let mut out = SeqOutput::default();
         if ticked {
-            self.step(p, clock, &mut out);
+            self.step(s, clock, &mut out);
         }
         out
     }
 
     /// Moves to the next step and triggers whatever is there.
-    fn step(&mut self, p: &Params, clock: ClockView, out: &mut SeqOutput) {
+    fn step(&mut self, s: &SeqSettings, clock: ClockView, out: &mut SeqOutput) {
         let next = if self.position == usize::MAX {
             0
         } else {
@@ -435,8 +482,8 @@ impl Sequencer {
         // Swing delays every second step. It is what separates a groove from a
         // metronome, and a little goes a long way — 0.1 to 0.2 is most of the
         // useful range.
-        let swing_delay = if self.position % 2 == 1 && p.seq_swing > 0.0 {
-            p.seq_swing * clock.samples_per_step
+        let swing_delay = if self.position % 2 == 1 && s.swing > 0.0 {
+            s.swing * clock.samples_per_step
         } else {
             0.0
         };
@@ -445,18 +492,23 @@ impl Sequencer {
             self.pending = Some(Pending {
                 note: step.note,
                 velocity: step.velocity,
+                accent: step.accent,
+                slide: step.slide,
                 samples_remaining: swing_delay,
             });
         } else {
-            self.trigger(step.note, step.velocity, p, clock, out);
+            self.trigger(step.note, step.velocity, step.accent, step.slide, s, clock, out);
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn trigger(
         &mut self,
         note: u8,
         velocity: f32,
-        p: &Params,
+        accent: bool,
+        slide: bool,
+        s: &SeqSettings,
         clock: ClockView,
         out: &mut SeqOutput,
     ) {
@@ -468,8 +520,10 @@ impl Sequencer {
         }
 
         out.note_on = Some((note, velocity));
+        out.accent = accent;
+        out.slide = slide;
         self.sounding = Some(note);
-        self.samples_until_off = p.seq_gate * clock.samples_per_step;
+        self.samples_until_off = s.gate * clock.samples_per_step;
     }
 
     /// Releases anything the sequencer is holding. Call when the transport
@@ -492,12 +546,13 @@ mod tests {
     /// The engine does this for real; the tests need the same wiring in one
     /// line, so that hoisting the clock does not turn into a rewrite of every
     /// test.
-    fn block(s: &mut Sequencer, c: &mut Clock, p: &Params) -> SeqOutput {
+    fn block(s: &mut Sequencer, c: &mut Clock, settings: &SeqSettings) -> SeqOutput {
+        let p = Params::default();
         if p.clock_source == ClockSource::Internal {
             c.set_tempo(p.tempo, p.steps_per_beat);
         }
         let adv = c.advance(BLOCK, p.clock_source);
-        s.advance(BLOCK, adv, c.view(), p)
+        s.advance(BLOCK, adv, c.view(), settings)
     }
 
     fn settings() -> GenerativeSettings {
@@ -666,6 +721,7 @@ mod tests {
         p.tempo = 120.0;
         p.steps_per_beat = 4.0;
         p.seq_gate = 0.5;
+        let settings = SeqSettings::from_params(&p);
         let mut c = Clock::new(48000.0);
         c.start();
 
@@ -673,7 +729,7 @@ mod tests {
         let mut offs = 0;
         // Four seconds of audio.
         for _ in 0..(48000 * 4 / BLOCK) {
-            let out = block(&mut s, &mut c, &p);
+            let out = block(&mut s, &mut c, &settings);
             if out.note_on.is_some() {
                 ons += 1;
             }
@@ -695,10 +751,11 @@ mod tests {
         let mut s = Sequencer::new(8);
         s.regenerate(&settings());
         let p = Params::default();
+        let settings = SeqSettings::from_params(&p);
         let mut c = Clock::new(48000.0);
         // Never started the clock.
         for _ in 0..10_000 {
-            assert_eq!(block(&mut s, &mut c, &p), SeqOutput::default());
+            assert_eq!(block(&mut s, &mut c, &settings), SeqOutput::default());
         }
     }
 
@@ -713,12 +770,13 @@ mod tests {
         p.tempo = 120.0;
         p.steps_per_beat = 4.0;
         p.seq_swing = 0.3;
+        let settings = SeqSettings::from_params(&p);
         let mut c = Clock::new(48000.0);
         c.start();
 
         let mut on_times = Vec::new();
         for blk in 0..(48000 * 2 / BLOCK) {
-            if block(&mut s, &mut c, &p).note_on.is_some() {
+            if block(&mut s, &mut c, &settings).note_on.is_some() {
                 on_times.push(blk * BLOCK);
             }
         }
@@ -746,6 +804,7 @@ mod tests {
             note,
             velocity: 1.0,
             accent: false,
+            slide: false,
         }; MAX_STEPS];
         Pattern::new(steps, len)
     }
@@ -755,7 +814,7 @@ mod tests {
     fn run_until(
         s: &mut Sequencer,
         c: &mut Clock,
-        p: &Params,
+        settings: &SeqSettings,
         what: &str,
         stop: impl Fn(&Sequencer) -> bool,
     ) {
@@ -763,7 +822,7 @@ mod tests {
             if stop(s) {
                 return;
             }
-            block(s, c, p);
+            block(s, c, settings);
         }
         panic!("gave up waiting for {what}");
     }
@@ -780,18 +839,19 @@ mod tests {
         let mut p = Params::default();
         p.tempo = 120.0;
         p.steps_per_beat = 4.0;
+        let settings = SeqSettings::from_params(&p);
         let mut c = Clock::new(48000.0);
         c.start();
 
         // Get off step zero first, so the wrap we are waiting for is a real one.
-        run_until(&mut s, &mut c, &p, "the first step", |s| s.position() == 1);
+        run_until(&mut s, &mut c, &settings, "the first step", |s| s.position() == 1);
 
         s.queue_pattern(marker_pattern(12, 16));
-        block(&mut s, &mut c, &p);
+        block(&mut s, &mut c, &settings);
         assert_eq!(s.pattern(), before.as_slice(), "swapped mid-loop");
         assert!(!s.take_pattern_changed());
 
-        run_until(&mut s, &mut c, &p, "the bar line", |s| s.position() == 0);
+        run_until(&mut s, &mut c, &settings, "the bar line", |s| s.position() == 0);
         assert!(
             s.pattern().iter().all(|step| step.note == 12),
             "did not swap at the bar line"
@@ -807,10 +867,11 @@ mod tests {
         let mut s = Sequencer::new(8);
         s.regenerate(&settings());
         let p = Params::default();
+        let settings = SeqSettings::from_params(&p);
         let mut c = Clock::new(48000.0);
 
         s.queue_pattern(marker_pattern(12, 8));
-        block(&mut s, &mut c, &p);
+        block(&mut s, &mut c, &settings);
 
         assert_eq!(s.pattern().len(), 8, "the pattern brought its own length");
         assert!(s.pattern().iter().all(|step| step.note == 12));
@@ -827,14 +888,99 @@ mod tests {
         let mut p = Params::default();
         p.tempo = 120.0;
         p.steps_per_beat = 4.0;
+        let settings = SeqSettings::from_params(&p);
         let mut c = Clock::new(48000.0);
         c.start();
-        run_until(&mut s, &mut c, &p, "the first step", |s| s.position() == 1);
+        run_until(&mut s, &mut c, &settings, "the first step", |s| s.position() == 1);
 
         s.queue_pattern(marker_pattern(12, 16));
         s.queue_pattern(marker_pattern(24, 16));
 
-        run_until(&mut s, &mut c, &p, "the bar line", |s| s.position() == 0);
+        run_until(&mut s, &mut c, &settings, "the bar line", |s| s.position() == 0);
         assert!(s.pattern().iter().all(|step| step.note == 24));
+    }
+
+    #[test]
+    fn output_carries_accent_and_slide_from_the_step() {
+        let mut s = Sequencer::new(0x51DE_0001);
+        s.set_step(
+            1,
+            Step { active: true, note: 40, velocity: 0.9, accent: true, slide: true },
+        );
+        let mut c = Clock::new(48_000.0);
+        c.start();
+        let p = Params { seq_length: 4, seq_swing: 0.0, ..Params::default() };
+        let settings = SeqSettings::from_params(&p);
+
+        // Run until the sequencer lands on step 1 and fires it.
+        let mut fired = None;
+        for _ in 0..4_000 {
+            let out = block(&mut s, &mut c, &settings);
+            if out.note_on == Some((40, 0.9)) {
+                fired = Some(out);
+                break;
+            }
+        }
+        let out = fired.expect("step 1 should have triggered");
+        assert!(out.accent, "an accented step must report accent");
+        assert!(out.slide, "a tied step must report slide");
+    }
+
+    #[test]
+    fn swung_notes_keep_their_accent_and_slide() {
+        // Swing routes odd steps through `Pending`, which is exactly where the
+        // step's flags used to be dropped.
+        let mut s = Sequencer::new(0x51DE_0002);
+        s.set_step(
+            1,
+            Step { active: true, note: 41, velocity: 0.9, accent: true, slide: true },
+        );
+        let mut c = Clock::new(48_000.0);
+        c.start();
+        let p = Params { seq_length: 4, seq_swing: 0.4, ..Params::default() };
+        let settings = SeqSettings::from_params(&p);
+
+        let mut fired = None;
+        for _ in 0..4_000 {
+            let out = block(&mut s, &mut c, &settings);
+            if out.note_on == Some((41, 0.9)) {
+                fired = Some(out);
+                break;
+            }
+        }
+        let out = fired.expect("swung step 1 should have triggered");
+        assert!(out.accent, "swing must not lose the accent flag");
+        assert!(out.slide, "swing must not lose the slide flag");
+    }
+
+    #[test]
+    fn settings_come_from_the_argument_not_the_global_params() {
+        // Two sequencers, one clock, different lengths: the whole point of
+        // lifting these three fields out of `Params`.
+        let mut lead = Sequencer::new(0x51DE_0003);
+        let mut bass = Sequencer::new(0x51DE_0003);
+        for i in 0..16 {
+            let step = Step { active: true, note: 40 + i as u8, velocity: 0.8, accent: false, slide: false };
+            lead.set_step(i, step);
+            bass.set_step(i, step);
+        }
+        let mut c = Clock::new(48_000.0);
+        c.start();
+        let p = Params::default();
+        let long = SeqSettings { length: 16, ..SeqSettings::from_params(&p) };
+        let short = SeqSettings { length: 2, ..SeqSettings::from_params(&p) };
+
+        let mut lead_max = 0usize;
+        let mut bass_max = 0usize;
+        for _ in 0..20_000 {
+            let adv = c.advance(BLOCK, p.clock_source);
+            let view = c.view();
+            lead.advance(BLOCK, adv, view, &long);
+            bass.advance(BLOCK, adv, view, &short);
+            lead_max = lead_max.max(lead.position());
+            bass_max = bass_max.max(bass.position());
+        }
+        assert!(lead_max > 8, "the long sequencer should reach the back half");
+        assert_eq!(bass_max, 1, "the short sequencer must loop within two steps");
     }
 }

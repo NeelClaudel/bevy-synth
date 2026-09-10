@@ -218,6 +218,7 @@ mod tests {
     use super::*;
     use crate::clock::Clock;
     use crate::params::{ClockSource, Params};
+    use crate::sequencer::SeqSettings;
     use crate::BLOCK;
 
     fn running_clock(p: &Params) -> Clock {
@@ -336,6 +337,7 @@ mod tests {
     fn a_sixteen_and_a_twelve_realign_after_forty_eight_steps() {
         let mut p = Params { drum_length: 16, ..Default::default() };
         p.seq_length = 12;
+        let settings = SeqSettings::from_params(&p);
         let mut c = running_clock(&p);
         let mut drums = DrumSequencer::new();
         let mut melody = crate::sequencer::Sequencer::new(1);
@@ -347,7 +349,7 @@ mod tests {
         while steps < 96 {
             let adv = c.advance(BLOCK, ClockSource::Internal);
             let out = drums.advance(BLOCK, adv, c.view(), &p);
-            let _ = melody.advance(BLOCK, adv, c.view(), &p);
+            let _ = melody.advance(BLOCK, adv, c.view(), &settings);
             if out.stepped {
                 if drums.position() == 0 && melody.position() == 0 {
                     together.push(steps);
@@ -370,6 +372,7 @@ mod tests {
     #[test]
     fn both_tracks_cross_every_step_boundary_together() {
         let mut p = Params::default();
+        let settings = SeqSettings::from_params(&p);
         let mut c = running_clock(&p);
         let mut drums = DrumSequencer::new();
         let mut melody = crate::sequencer::Sequencer::new(1);
@@ -382,7 +385,7 @@ mod tests {
             }
             let adv = c.advance(BLOCK, ClockSource::Internal);
             let d = drums.advance(BLOCK, adv, c.view(), &p);
-            let m = melody.advance(BLOCK, adv, c.view(), &p);
+            let m = melody.advance(BLOCK, adv, c.view(), &settings);
             assert_eq!(d.stepped, m.stepped, "tracks disagreed at block {i}");
         }
 
@@ -393,7 +396,7 @@ mod tests {
         for i in 0..240 {
             let ticked = c.on_midi_tick(p.steps_per_beat);
             let d = drums.on_tick(ticked, c.view(), &p);
-            let m = melody.on_midi_tick(ticked, c.view(), &p);
+            let m = melody.on_midi_tick(ticked, c.view(), &settings);
             assert_eq!(d.stepped, m.stepped, "tracks disagreed at tick {i}");
             steps += usize::from(d.stepped);
         }
@@ -407,6 +410,7 @@ mod tests {
     #[test]
     fn both_tracks_swing_the_same_steps_by_the_same_amount() {
         let p = Params { seq_swing: 0.3, ..Default::default() };
+        let settings = SeqSettings::from_params(&p);
         let mut c = running_clock(&p);
         let mut drums = DrumSequencer::new();
         let mut melody = crate::sequencer::Sequencer::new(1);
@@ -424,7 +428,7 @@ mod tests {
         for i in 0..4_000 {
             let adv = c.advance(BLOCK, ClockSource::Internal);
             let d = drums.advance(BLOCK, adv, c.view(), &p);
-            let m = melody.advance(BLOCK, adv, c.view(), &p);
+            let m = melody.advance(BLOCK, adv, c.view(), &settings);
             if d.stepped {
                 stepped_on.push(i);
             }

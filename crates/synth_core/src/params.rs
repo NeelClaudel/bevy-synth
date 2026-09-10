@@ -645,13 +645,15 @@ impl Default for Params {
 
 /// Packs a step into one word.
 ///
-/// Bit 31 active, bit 30 accent, bits 8-15 note, bits 0-7 velocity quantised
-/// to 8 bits. Velocity to 1/255 is finer than any display or ear needs, and
-/// fitting a whole step into a single word is what makes it tear-free: the
-/// reader either sees the old step or the new one, never half of each.
+/// Bit 31 active, bit 30 accent, bit 29 slide, bits 8-15 note, bits 0-7
+/// velocity quantised to 8 bits. Velocity to 1/255 is finer than any display
+/// or ear needs, and fitting a whole step into a single word is what makes it
+/// tear-free: the reader either sees the old step or the new one, never half
+/// of each.
 fn pack_step(step: &crate::sequencer::Step) -> u32 {
     ((step.active as u32) << 31)
         | ((step.accent as u32) << 30)
+        | ((step.slide as u32) << 29)
         | ((step.note as u32) << 8)
         | ((step.velocity.clamp(0.0, 1.0) * 255.0) as u32)
 }
@@ -661,6 +663,7 @@ fn unpack_step(packed: u32) -> crate::sequencer::Step {
     crate::sequencer::Step {
         active: packed & (1 << 31) != 0,
         accent: packed & (1 << 30) != 0,
+        slide: packed & (1 << 29) != 0,
         note: ((packed >> 8) & 0xFF) as u8,
         velocity: (packed & 0xFF) as f32 / 255.0,
     }
@@ -1326,6 +1329,24 @@ mod tests {
     }
 
     #[test]
+    fn packed_step_round_trips_slide() {
+        let step = crate::sequencer::Step {
+            active: true,
+            note: 37,
+            velocity: 0.75,
+            accent: true,
+            slide: true,
+        };
+        let back = unpack_step(pack_step(&step));
+        assert!(back.slide, "slide must survive the mirror");
+        assert!(back.accent);
+        assert_eq!(back.note, 37);
+
+        let plain = crate::sequencer::Step { slide: false, ..step };
+        assert!(!unpack_step(pack_step(&plain)).slide);
+    }
+
+    #[test]
     fn smoothed_converges_without_overshoot() {
         let mut s = Smoothed::new(0.0, 10.0, 1500.0);
         s.set_target(1.0);
@@ -1360,6 +1381,7 @@ mod tests {
                 note,
                 velocity,
                 accent,
+                slide: false,
             };
             shared.publish_step(index, &step);
             let back = shared.read_step(index);
@@ -1407,12 +1429,14 @@ mod tests {
             note: 60,
             velocity: 1.0,
             accent: true,
+            slide: false,
         };
         steps[3] = Step {
             active: true,
             note: 67,
             velocity: 0.5,
             accent: false,
+            slide: false,
         };
         shared.queue_pattern(&Pattern::new(steps, 8));
 
