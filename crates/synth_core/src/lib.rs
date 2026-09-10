@@ -24,6 +24,7 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod bass;
 pub mod clock;
 pub mod drums;
 pub mod engine;
@@ -40,6 +41,7 @@ pub mod scale;
 pub mod sequencer;
 pub mod voice;
 
+pub use bass::BassVoice;
 pub use clock::{Clock, ClockSource, ClockView};
 pub use drums::{Cell, DrumBuses, DrumPattern, DrumRack, DrumVoice, Pad, PAD_COUNT};
 pub use engine::{Engine, MAX_VOICES};
