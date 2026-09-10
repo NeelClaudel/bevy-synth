@@ -282,6 +282,101 @@ impl SharedCompressor {
     }
 }
 
+/// The bassline voice, as eight knobs.
+///
+/// A 303 is a small instrument on purpose: one oscillator, one lowpass, one
+/// envelope aimed at the cutoff, and two per-step gestures — accent and slide
+/// — that do the expressive work. There is no `level` here; the bus owns the
+/// bass's level as `bass_gain`, and duplicating it would only let the two
+/// drift apart.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BassParams {
+    /// Saw or pulse. The two the original offered, and the two that suit it.
+    pub wave: crate::osc::Waveform,
+    /// Transpose, in semitones.
+    pub tune: f32,
+    /// Filter cutoff before the envelope is added, in Hz.
+    pub cutoff: f32,
+    /// Filter resonance. High values are the point of the instrument.
+    pub resonance: f32,
+    /// How far the filter envelope opens the cutoff, in octaves.
+    pub env_mod: f32,
+    /// Filter envelope decay, in seconds. The single most important knob.
+    pub decay: f32,
+    /// How much an accented step adds: level, cutoff and envelope depth all
+    /// come off this one control.
+    pub accent: f32,
+    /// How long a tied note takes to glide to its new pitch, in seconds.
+    pub slide_time: f32,
+}
+
+impl Default for BassParams {
+    fn default() -> Self {
+        Self {
+            wave: crate::osc::Waveform::Saw,
+            tune: 0.0,
+            cutoff: 300.0,
+            resonance: 0.7,
+            env_mod: 3.0,
+            decay: 0.3,
+            accent: 0.5,
+            slide_time: 0.06,
+        }
+    }
+}
+
+/// The atomic mirror of [`BassParams`].
+#[derive(Debug)]
+pub struct SharedBass {
+    pub wave: AtomicEnum,
+    pub tune: AtomicF32,
+    pub cutoff: AtomicF32,
+    pub resonance: AtomicF32,
+    pub env_mod: AtomicF32,
+    pub decay: AtomicF32,
+    pub accent: AtomicF32,
+    pub slide_time: AtomicF32,
+}
+
+impl SharedBass {
+    pub fn new(p: &BassParams) -> Self {
+        Self {
+            wave: AtomicEnum::new(p.wave as u32),
+            tune: AtomicF32::new(p.tune),
+            cutoff: AtomicF32::new(p.cutoff),
+            resonance: AtomicF32::new(p.resonance),
+            env_mod: AtomicF32::new(p.env_mod),
+            decay: AtomicF32::new(p.decay),
+            accent: AtomicF32::new(p.accent),
+            slide_time: AtomicF32::new(p.slide_time),
+        }
+    }
+
+    pub fn snapshot(&self) -> BassParams {
+        BassParams {
+            wave: crate::osc::Waveform::from_u32(self.wave.get()),
+            tune: sane(self.tune.get(), 0.0).clamp(-12.0, 12.0),
+            cutoff: sane(self.cutoff.get(), 300.0).clamp(20.0, 20_000.0),
+            resonance: sane(self.resonance.get(), 0.7).clamp(0.0, 1.0),
+            env_mod: sane(self.env_mod.get(), 3.0).clamp(0.0, 6.0),
+            decay: sane(self.decay.get(), 0.3).clamp(0.02, 2.0),
+            accent: sane(self.accent.get(), 0.5).clamp(0.0, 1.0),
+            slide_time: sane(self.slide_time.get(), 0.06).clamp(0.01, 0.5),
+        }
+    }
+
+    pub fn apply(&self, p: &BassParams) {
+        self.wave.set(p.wave as u32);
+        self.tune.set(p.tune);
+        self.cutoff.set(p.cutoff);
+        self.resonance.set(p.resonance);
+        self.env_mod.set(p.env_mod);
+        self.decay.set(p.decay);
+        self.accent.set(p.accent);
+        self.slide_time.set(p.slide_time);
+    }
+}
+
 /// A one-pole smoother for a continuous parameter.
 ///
 /// Runs at control rate (once per [`crate::BLOCK`]), not per sample: at 48 kHz
@@ -1674,5 +1769,39 @@ mod tests {
         assert_eq!(back.comp_synth.ratio, 4.0);
         assert_eq!(back.comp_master.attack_ms, 0.1);
         assert_eq!(back.comp_master.release_ms, 1000.0);
+    }
+
+    #[test]
+    fn shared_bass_round_trips_and_rejects_nonsense() {
+        let p = BassParams {
+            wave: crate::osc::Waveform::Pulse,
+            tune: -5.0,
+            cutoff: 820.0,
+            resonance: 0.9,
+            env_mod: 4.5,
+            decay: 0.12,
+            accent: 0.8,
+            slide_time: 0.2,
+        };
+        let shared = SharedBass::new(&p);
+        assert_eq!(shared.snapshot(), p);
+
+        // Everything the control side can write goes through `sane` and a
+        // range clamp, so nothing non-finite or out of range reaches the
+        // audio thread.
+        shared.cutoff.set(f32::NAN);
+        shared.resonance.set(40.0);
+        shared.decay.set(-3.0);
+        shared.slide_time.set(f32::INFINITY);
+        let out = shared.snapshot();
+        assert_eq!(out.cutoff, 300.0, "NaN falls back to the default");
+        assert_eq!(out.resonance, 1.0);
+        assert_eq!(out.decay, 0.02);
+        assert_eq!(out.slide_time, 0.06);
+
+        // `apply` is the inverse of `new`.
+        let other = BassParams::default();
+        shared.apply(&other);
+        assert_eq!(shared.snapshot(), other);
     }
 }
