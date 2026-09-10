@@ -21,6 +21,9 @@ pub(crate) fn compressor_section(ui: &mut Ui, synth: &Synth, telemetry: &SynthTe
         one(ui, "synth bus", palette::OSC, &p.comp_synth, telemetry.comp_synth_gr);
         ui.add_space(6.0);
         ui.separator();
+        one(ui, "bass bus", palette::BASS, &p.comp_bass, telemetry.comp_bass_gr);
+        ui.add_space(6.0);
+        ui.separator();
         one(ui, "master", palette::ACCENT, &p.comp_master, telemetry.comp_master_gr);
     });
 }

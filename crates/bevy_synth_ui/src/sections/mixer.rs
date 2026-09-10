@@ -7,7 +7,7 @@ use bevy_synth::{Synth, SynthTelemetry};
 use crate::SynthUi;
 use crate::widgets::{self, KnobSpec, palette};
 
-/// The output stage, as three strips and a meter.
+/// The output stage, as four strips and a meter.
 ///
 /// These knobs used to sit wherever the thing they scaled was edited: master
 /// and synth level up in the transport bar, the drum levels at the bottom of
@@ -64,6 +64,28 @@ pub(crate) fn mixer(ui: &mut Ui, synth: &Synth, telemetry: &SynthTelemetry, stat
                     &p.synth_send,
                 )
                 .on_hover_text("how much of the synth bus reaches delay and reverb");
+            });
+
+            ui.separator();
+            strip(ui, "bass", |ui| {
+                widgets::knob_param(
+                    ui,
+                    &KnobSpec::new("Gain", 0.0..=1.5)
+                        .colour(palette::BASS)
+                        .default(1.0)
+                        .size(36.0),
+                    &p.bass_gain,
+                )
+                .on_hover_text("level of the bass bus alone, under the master");
+                widgets::knob_param(
+                    ui,
+                    &KnobSpec::new("Send", 0.0..=1.0)
+                        .colour(palette::FX)
+                        .default(0.0)
+                        .size(36.0),
+                    &p.bass_send,
+                )
+                .on_hover_text("how much of the bass reaches the effects return");
             });
 
             ui.separator();

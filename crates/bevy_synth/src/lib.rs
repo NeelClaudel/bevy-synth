@@ -403,6 +403,8 @@ pub struct SynthTelemetry {
     pub peak: f32,
     /// Gain reduction the synth-bus compressor is applying, in positive dB.
     pub comp_synth_gr: f32,
+    /// Gain reduction the bass-bus compressor is applying, in positive dB.
+    pub comp_bass_gr: f32,
     /// Gain reduction the master compressor is applying, in positive dB.
     pub comp_master_gr: f32,
 }
@@ -422,5 +424,6 @@ fn read_telemetry(synth: Res<Synth>, mut telemetry: ResMut<SynthTelemetry>) {
     // Plain reads, not `take_*`: these are levels, not accumulators, so
     // there is nothing to reset.
     telemetry.comp_synth_gr = synth.params.comp_synth_gr.get();
+    telemetry.comp_bass_gr = synth.params.comp_bass_gr.get();
     telemetry.comp_master_gr = synth.params.comp_master_gr.get();
 }
