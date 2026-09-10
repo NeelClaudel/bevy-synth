@@ -1799,6 +1799,36 @@ mod tests {
         assert_eq!(out.decay, 0.02);
         assert_eq!(out.slide_time, 0.06);
 
+        // The remaining continuous fields go through the same sane-then-clamp
+        // treatment: NaN falls back to the default, and an out-of-range value
+        // clamps at either end.
+        shared.tune.set(f32::NAN);
+        shared.env_mod.set(f32::NAN);
+        shared.accent.set(f32::NAN);
+        let out = shared.snapshot();
+        assert_eq!(out.tune, 0.0, "NaN falls back to the default");
+        assert_eq!(out.env_mod, 3.0, "NaN falls back to the default");
+        assert_eq!(out.accent, 0.5, "NaN falls back to the default");
+
+        shared.tune.set(99.0);
+        shared.env_mod.set(99.0);
+        shared.accent.set(99.0);
+        let out = shared.snapshot();
+        assert_eq!(out.tune, 12.0, "clamps to the top of its range");
+        assert_eq!(out.env_mod, 6.0, "clamps to the top of its range");
+        assert_eq!(out.accent, 1.0, "clamps to the top of its range");
+
+        shared.tune.set(-99.0);
+        let out = shared.snapshot();
+        assert_eq!(out.tune, -12.0, "clamps to the bottom of its range");
+
+        // An unknown waveform discriminant clamps to Saw rather than
+        // panicking, the same fallback `Waveform::from_u32` uses everywhere
+        // else it decodes an atomic.
+        shared.wave.set(99);
+        let out = shared.snapshot();
+        assert_eq!(out.wave, crate::osc::Waveform::Saw);
+
         // `apply` is the inverse of `new`.
         let other = BassParams::default();
         shared.apply(&other);
