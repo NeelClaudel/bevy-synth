@@ -36,7 +36,7 @@ use egui::{Ui, Vec2};
 use bevy_synth::{Synth, SynthTelemetry};
 use synth_core::filter::{Slope, SvfMode};
 use synth_core::lfo::{LfoTarget, LfoWave};
-use synth_core::params::{AtomicEnum, ClockSource, VoiceMode};
+use synth_core::params::{AtomicEnum, ClockSource, SidechainSource, VoiceMode};
 use synth_core::{NoteDivision, Scale, Waveform};
 
 pub mod presets;
@@ -199,6 +199,8 @@ ui_enum!(LfoWave, &LfoWave::ALL, |w: LfoWave| w.name());
 ui_enum!(LfoTarget, &LfoTarget::ALL, |t: LfoTarget| t.name());
 ui_enum!(Scale, &Scale::ALL, |s: Scale| s.name());
 ui_enum!(NoteDivision, &NoteDivision::ALL, |d: NoteDivision| d.name());
+ui_enum!(SidechainSource, &SidechainSource::ALL, |s: SidechainSource| s
+    .name());
 ui_enum!(
     Slope,
     &[Slope::Db12, Slope::Db24],
@@ -321,7 +323,7 @@ fn panel(
 
                 match ui_state.tab {
                     Tab::Synth => {
-                        synth_columns(ui, &synth, visible_width);
+                        synth_columns(ui, &synth, &telemetry, visible_width);
                         ui.add_space(2.0);
                         sections::keyboard(ui, &synth, &mut ui_state);
                     }
@@ -358,7 +360,7 @@ fn tab_bar(ui: &mut Ui, state: &mut SynthUi) {
 /// individual widgets: each column here is a `vertical` block that claims the
 /// whole remaining width as it goes, so wrapping would put every column on a
 /// row of its own no matter how wide the window was.
-fn synth_columns(ui: &mut Ui, synth: &Synth, width: f32) {
+fn synth_columns(ui: &mut Ui, synth: &Synth, telemetry: &SynthTelemetry, width: f32) {
     // About the natural width of one column of sections. It only decides how
     // many columns fit, so guessing low is the safe direction to be wrong in:
     // too few columns per row still fits on screen, too many does not.
@@ -380,6 +382,7 @@ fn synth_columns(ui: &mut Ui, synth: &Synth, width: f32) {
         &|ui| {
             sections::delay_section(ui, synth);
             sections::reverb_section(ui, synth);
+            sections::compressor_section(ui, synth, telemetry);
         },
     ];
 

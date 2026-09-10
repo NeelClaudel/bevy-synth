@@ -140,6 +140,24 @@ pub(crate) fn drums(ui: &mut Ui, synth: &Synth, telemetry: &SynthTelemetry, stat
                 &p.pad_decay[pad],
             )
             .on_hover_text("multiplier on the pad's natural decay, not a time in seconds");
+            widgets::knob_param(
+                ui,
+                &KnobSpec::new("Pan", -1.0..=1.0)
+                    .colour(palette::DRUM)
+                    .default(0.0)
+                    .size(36.0),
+                &p.pad_pan[pad],
+            )
+            .on_hover_text("hard left to hard right; centre is unity in both channels");
+            widgets::knob_param(
+                ui,
+                &KnobSpec::new("Send", 0.0..=1.0)
+                    .colour(palette::FX)
+                    .default(1.0)
+                    .size(36.0),
+                &p.pad_send[pad],
+            )
+            .on_hover_text("how much of this pad reaches the effects, under the rack's Send");
         });
     });
 }

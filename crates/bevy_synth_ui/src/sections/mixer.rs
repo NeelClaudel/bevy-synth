@@ -55,6 +55,15 @@ pub(crate) fn mixer(ui: &mut Ui, synth: &Synth, telemetry: &SynthTelemetry, stat
                     &p.drive,
                 )
                 .on_hover_text("saturation on the synth bus; the drums do not pass through it");
+                widgets::knob_param(
+                    ui,
+                    &KnobSpec::new("Send", 0.0..=1.0)
+                        .colour(palette::FX)
+                        .default(1.0)
+                        .size(36.0),
+                    &p.synth_send,
+                )
+                .on_hover_text("how much of the synth bus reaches delay and reverb");
             });
 
             ui.separator();
@@ -77,6 +86,15 @@ pub(crate) fn mixer(ui: &mut Ui, synth: &Synth, telemetry: &SynthTelemetry, stat
                     &p.drum_level,
                 )
                 .on_hover_text("trim inside the rack, after the per-pad levels");
+                widgets::knob_param(
+                    ui,
+                    &KnobSpec::new("Send", 0.0..=1.0)
+                        .colour(palette::FX)
+                        .default(0.0)
+                        .size(36.0),
+                    &p.drum_send,
+                )
+                .on_hover_text("how much of the drum bus reaches delay and reverb");
             });
 
             ui.separator();
