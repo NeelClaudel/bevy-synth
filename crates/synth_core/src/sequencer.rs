@@ -116,6 +116,12 @@ pub struct GenerativeSettings {
     pub max_jump: f32,
     pub chord_bias: f32,
     pub length: usize,
+    /// Chance a step is tied to the one before it. `0.0` skips the draw
+    /// entirely, which is what keeps the lead's RNG stream unchanged.
+    pub slide_chance: f32,
+    /// Chance a step is accented on top of the downbeats it already gets.
+    /// `0.0` skips the draw, as above.
+    pub accent_chance: f32,
 }
 
 impl GenerativeSettings {
@@ -129,6 +135,11 @@ impl GenerativeSettings {
             max_jump: p.gen_max_jump,
             chord_bias: p.gen_chord_bias,
             length: p.seq_length,
+            // The lead has neither control. Zero here is load-bearing: it is
+            // what makes the two draws below short-circuit, leaving the lead's
+            // RNG stream byte-identical and `GOLDEN_HASH` intact.
+            slide_chance: 0.0,
+            accent_chance: 0.0,
         }
     }
 }
@@ -185,6 +196,8 @@ struct Pending {
     velocity: f32,
     accent: bool,
     slide: bool,
+    /// The step after this one is a tie, so ignore the gate and hold.
+    hold: bool,
     samples_remaining: f32,
 }
 
@@ -360,13 +373,17 @@ impl Sequencer {
                 0.5 + self.rng.next_f32() * 0.25
             };
 
-            self.pattern[i] = Step {
-                active: true,
-                note,
-                velocity,
-                accent: strong,
-                slide: false,
-            };
+            // Both draws short-circuit at 0.0. This is not a micro-
+            // optimisation: an unconditional draw would advance the RNG on
+            // every step of every lead pattern and change every melody the
+            // synth has ever generated.
+            let mut accent = strong;
+            if gen.accent_chance > 0.0 && !accent {
+                accent = self.rng.chance(gen.accent_chance);
+            }
+            let slide = gen.slide_chance > 0.0 && self.rng.chance(gen.slide_chance);
+
+            self.pattern[i] = Step { active: true, note, velocity, accent, slide };
         }
     }
 
@@ -430,6 +447,7 @@ impl Sequencer {
                     pending.velocity,
                     pending.accent,
                     pending.slide,
+                    pending.hold,
                     s,
                     clock,
                     &mut out,
@@ -479,6 +497,14 @@ impl Sequencer {
             return;
         }
 
+        // A tie needs the note before it still sounding when it lands, or the
+        // glide has nothing to glide from. Look one step ahead: hold this note
+        // through the whole step rather than releasing it at the gate. Two
+        // steps rather than one, so the maximum swing delay of 0.6 is covered
+        // and the note still releases if the tie is edited away mid-flight.
+        let following = self.pattern[(self.position + 1) % self.length];
+        let hold = following.active && following.slide;
+
         // Swing delays every second step. It is what separates a groove from a
         // metronome, and a little goes a long way — 0.1 to 0.2 is most of the
         // useful range.
@@ -494,10 +520,11 @@ impl Sequencer {
                 velocity: step.velocity,
                 accent: step.accent,
                 slide: step.slide,
+                hold,
                 samples_remaining: swing_delay,
             });
         } else {
-            self.trigger(step.note, step.velocity, step.accent, step.slide, s, clock, out);
+            self.trigger(step.note, step.velocity, step.accent, step.slide, hold, s, clock, out);
         }
     }
 
@@ -508,6 +535,7 @@ impl Sequencer {
         velocity: f32,
         accent: bool,
         slide: bool,
+        hold: bool,
         s: &SeqSettings,
         clock: ClockView,
         out: &mut SeqOutput,
@@ -523,7 +551,11 @@ impl Sequencer {
         out.accent = accent;
         out.slide = slide;
         self.sounding = Some(note);
-        self.samples_until_off = s.gate * clock.samples_per_step;
+        self.samples_until_off = if hold {
+            2.0 * clock.samples_per_step
+        } else {
+            s.gate * clock.samples_per_step
+        };
     }
 
     /// Releases anything the sequencer is holding. Call when the transport
@@ -565,6 +597,8 @@ mod tests {
             max_jump: 3.0,
             chord_bias: 0.6,
             length: 16,
+            slide_chance: 0.0,
+            accent_chance: 0.0,
         }
     }
 
@@ -982,5 +1016,136 @@ mod tests {
         }
         assert!(lead_max > 8, "the long sequencer should reach the back half");
         assert_eq!(bass_max, 1, "the short sequencer must loop within two steps");
+    }
+
+    /// Generative settings for the tests below, with the two new chances
+    /// spelled out so their effect is never accidental.
+    fn gen_with(slide_chance: f32, accent_chance: f32) -> GenerativeSettings {
+        GenerativeSettings {
+            root: 0,
+            scale: Scale::NaturalMinor,
+            octave: 3,
+            range: 2,
+            density: 0.9,
+            max_jump: 3.0,
+            chord_bias: 0.6,
+            length: 16,
+            slide_chance,
+            accent_chance,
+        }
+    }
+
+    #[test]
+    fn zero_chances_produce_no_slides_and_only_downbeat_accents() {
+        let mut s = Sequencer::new(0x6EA5_0001);
+        s.regenerate(&gen_with(0.0, 0.0));
+        for (i, step) in s.pattern().iter().enumerate() {
+            assert!(!step.slide, "step {i} was marked for slide at chance 0.0");
+            assert_eq!(
+                step.accent,
+                i % 4 == 0,
+                "step {i} accent should still be the downbeat marker alone"
+            );
+        }
+    }
+
+    #[test]
+    fn nonzero_chances_draw_from_the_rng() {
+        // The short-circuit is the whole reason the lead's stream is
+        // unchanged. Prove the draw really is skipped at 0.0 by showing it
+        // is *not* skipped above it: the extra draws shift the stream, so
+        // the same seed yields different notes.
+        let mut zero = Sequencer::new(0x6EA5_0002);
+        zero.regenerate(&gen_with(0.0, 0.0));
+        let zero_notes: Vec<u8> = zero.pattern().iter().map(|s| s.note).collect();
+
+        let mut accented = Sequencer::new(0x6EA5_0002);
+        accented.regenerate(&gen_with(0.0, 0.5));
+        let accented_notes: Vec<u8> = accented.pattern().iter().map(|s| s.note).collect();
+
+        assert_ne!(
+            zero_notes, accented_notes,
+            "a nonzero accent chance must consume RNG, shifting the melody"
+        );
+
+        let mut slid = Sequencer::new(0x6EA5_0002);
+        slid.regenerate(&gen_with(1.0, 0.0));
+        assert!(
+            slid.pattern().iter().filter(|s| s.active).all(|s| s.slide),
+            "at chance 1.0 every sounding step should be tied"
+        );
+    }
+
+    #[test]
+    fn a_tie_holds_the_note_before_it_past_the_gate() {
+        let mut s = Sequencer::new(0x6EA5_0003);
+        for i in 0..4 {
+            s.set_step(
+                i,
+                Step { active: true, note: 40, velocity: 0.8, accent: false, slide: i == 1 },
+            );
+        }
+        let mut c = Clock::new(48_000.0);
+        c.start();
+        // A short gate: without the lookahead, step 0 releases well before
+        // step 1 arrives.
+        let p = Params { seq_length: 4, seq_swing: 0.0, seq_gate: 0.2, ..Params::default() };
+        let settings = SeqSettings::from_params(&p);
+
+        let mut seen_first_on = false;
+        let mut off_before_tie = false;
+        for _ in 0..4_000 {
+            let out = block(&mut s, &mut c, &settings);
+            if out.note_on.is_some() {
+                if seen_first_on {
+                    // This is the tie. Stop here.
+                    assert!(out.slide, "step 1 is the tie");
+                    break;
+                }
+                seen_first_on = true;
+                continue;
+            }
+            if seen_first_on && out.note_off.is_some() {
+                off_before_tie = true;
+            }
+        }
+        assert!(
+            !off_before_tie,
+            "the gate must not expire between a note and the tie that follows it"
+        );
+    }
+
+    #[test]
+    fn an_untied_step_still_honours_the_gate() {
+        let mut s = Sequencer::new(0x6EA5_0004);
+        for i in 0..4 {
+            s.set_step(
+                i,
+                Step { active: true, note: 40, velocity: 0.8, accent: false, slide: false },
+            );
+        }
+        let mut c = Clock::new(48_000.0);
+        c.start();
+        let p = Params { seq_length: 4, seq_swing: 0.0, seq_gate: 0.2, ..Params::default() };
+        let settings = SeqSettings::from_params(&p);
+
+        let mut seen_first_on = false;
+        let mut off_before_next = false;
+        for _ in 0..4_000 {
+            let out = block(&mut s, &mut c, &settings);
+            if seen_first_on && out.note_off.is_some() {
+                off_before_next = true;
+            }
+            if out.note_on.is_some() {
+                if seen_first_on {
+                    break;
+                }
+                seen_first_on = true;
+            }
+        }
+        assert!(
+            off_before_next,
+            "with no tie, a 0.2 gate must release long before the next step"
+        );
     }
 }
