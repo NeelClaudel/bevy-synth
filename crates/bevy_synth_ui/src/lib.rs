@@ -85,19 +85,22 @@ pub enum Tab {
     Synth,
     /// The step sequencer and its pattern slots.
     Sequencer,
+    /// The bassline: its voice, its own line, its own generator.
+    Bass,
     /// The drum rack.
     Drums,
 }
 
 impl Tab {
     /// Left to right, in the order the signal is usually built up.
-    pub const ALL: [Self; 3] = [Self::Synth, Self::Sequencer, Self::Drums];
+    pub const ALL: [Self; 4] = [Self::Synth, Self::Sequencer, Self::Bass, Self::Drums];
 
     /// The label on the tab.
     pub fn name(self) -> &'static str {
         match self {
             Self::Synth => "SYNTH",
             Self::Sequencer => "SEQ",
+            Self::Bass => "BASS",
             Self::Drums => "DRUMS",
         }
     }
@@ -328,6 +331,7 @@ fn panel(
                         sections::keyboard(ui, &synth, &mut ui_state);
                     }
                     Tab::Sequencer => sections::sequencer(ui, &synth, &telemetry, &mut ui_state),
+                    Tab::Bass => sections::bass(ui, &synth, &telemetry, &mut ui_state),
                     Tab::Drums => sections::drums(ui, &synth, &telemetry, &mut ui_state),
                 }
             });

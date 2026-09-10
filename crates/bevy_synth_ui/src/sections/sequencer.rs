@@ -224,7 +224,7 @@ fn pattern_slots(ui: &mut Ui, synth: &Synth, state: &mut SynthUi) {
 ///
 /// The system clock is plenty: this picks a melody, and nothing about it needs
 /// to be unpredictable to an adversary.
-fn rand_seed() -> u64 {
+pub(crate) fn rand_seed() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

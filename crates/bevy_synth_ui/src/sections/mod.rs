@@ -5,6 +5,7 @@
 //! The modules are private and their entry points re-exported, so a caller
 //! writes `sections::filter_section` rather than `sections::filter::filter_section`.
 
+mod bass;
 mod compressor;
 mod delay;
 mod drums;
@@ -19,6 +20,7 @@ mod sequencer;
 mod transport;
 mod voices;
 
+pub(crate) use bass::bass;
 pub(crate) use compressor::compressor_section;
 pub(crate) use delay::delay_section;
 pub(crate) use drums::drums;

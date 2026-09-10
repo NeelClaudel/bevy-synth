@@ -50,6 +50,8 @@ pub mod palette {
     /// (255, 176, 84) and `ACCENT` is (255, 214, 102) — so the rack takes the
     /// gap between `ENV`'s mint and `ACCENT`'s yellow.
     pub const DRUM: Color32 = Color32::from_rgb(198, 226, 106);
+    /// The bassline: its tab, its knobs and its mixer strip.
+    pub const BASS: Color32 = Color32::from_rgb(226, 116, 196);
 
     pub const ACCENT: Color32 = Color32::from_rgb(255, 214, 102);
     pub const DANGER: Color32 = Color32::from_rgb(255, 96, 96);
@@ -620,6 +622,125 @@ pub fn step_grid(
                 }
             });
             ui.add_space(3.0);
+        }
+    });
+
+    clicked
+}
+
+/// What a click on the bass grid asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BassEdit {
+    /// The body of the cell: turn the step on or off.
+    Toggle,
+    /// The left strip along the bottom: tie this step to the one before it.
+    Slide,
+    /// The right strip: accent it.
+    Accent,
+}
+
+/// The bass pattern as a grid of steps.
+///
+/// A cell here carries three decisions rather than one — is there a note, is
+/// it tied, is it accented — so it gets its own widget rather than growing
+/// [`step_grid`] with two dead zones on every lead cell. The body toggles the
+/// note; the two strips along the bottom edge toggle the tie and the accent.
+pub fn bass_step_grid(
+    ui: &mut Ui,
+    steps: &[synth_core::sequencer::Step],
+    current: usize,
+    playing: bool,
+) -> Option<(usize, BassEdit)> {
+    let mut clicked = None;
+    const PER_ROW: usize = 16;
+
+    ui.vertical(|ui| {
+        for (row_index, row_steps) in steps.chunks(PER_ROW).enumerate() {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 3.0;
+                for (column, step) in row_steps.iter().enumerate() {
+                    let index = row_index * PER_ROW + column;
+                    let (rect, response) =
+                        ui.allocate_exact_size(Vec2::new(30.0, 42.0), Sense::click());
+
+                    // The bottom eight pixels are the two strips.
+                    let strip_top = rect.bottom() - 8.0;
+                    let slide_rect = Rect::from_min_max(
+                        Pos2::new(rect.left(), strip_top),
+                        Pos2::new(rect.center().x - 1.0, rect.bottom()),
+                    );
+                    let accent_rect = Rect::from_min_max(
+                        Pos2::new(rect.center().x + 1.0, strip_top),
+                        Pos2::new(rect.right(), rect.bottom()),
+                    );
+
+                    if response.clicked() {
+                        if let Some(pos) = response.interact_pointer_pos() {
+                            clicked = Some(if slide_rect.contains(pos) {
+                                (index, BassEdit::Slide)
+                            } else if accent_rect.contains(pos) {
+                                (index, BassEdit::Accent)
+                            } else {
+                                (index, BassEdit::Toggle)
+                            });
+                        }
+                    }
+
+                    let is_current = playing && index == current;
+                    let painter = ui.painter_at(rect);
+
+                    let background = if is_current {
+                        palette::SEQ
+                    } else if step.active {
+                        palette::BASS.gamma_multiply(0.45)
+                    } else if index.is_multiple_of(4) {
+                        palette::TRACK
+                    } else {
+                        palette::PANEL
+                    };
+                    painter.rect_filled(rect, 3.0, background);
+
+                    if response.hovered() {
+                        painter.rect_stroke(
+                            rect,
+                            3.0,
+                            Stroke::new(1.0, palette::TEXT),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+
+                    if step.active {
+                        let note = synth_core::Note::new(step.note, step.velocity);
+                        let (name, octave) = note.name();
+                        let text_colour = if is_current {
+                            palette::PANEL
+                        } else {
+                            palette::TEXT
+                        };
+                        painter.text(
+                            rect.center() - Vec2::new(0.0, 7.0),
+                            Align2::CENTER_CENTER,
+                            format!("{name}{octave}"),
+                            FontId::monospace(9.5),
+                            text_colour,
+                        );
+                    }
+
+                    // The two strips are always drawn, lit when set: an
+                    // unlit strip is what tells you the affordance is there.
+                    let dim = palette::TRACK;
+                    painter.rect_filled(
+                        slide_rect,
+                        1.0,
+                        if step.slide { palette::ACCENT } else { dim },
+                    );
+                    painter.rect_filled(
+                        accent_rect,
+                        1.0,
+                        if step.accent { palette::SEQ } else { dim },
+                    );
+                }
+            });
         }
     });
 

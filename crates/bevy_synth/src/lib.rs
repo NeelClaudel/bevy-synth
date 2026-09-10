@@ -390,6 +390,8 @@ impl Synth {
 pub struct SynthTelemetry {
     /// Sequencer step currently playing.
     pub current_step: u32,
+    /// Bass sequencer step currently playing.
+    pub bass_step: u32,
     /// Whether the step changed this frame. The cue for beat-synced visuals.
     pub step_changed: bool,
     /// Drum grid column currently playing.
@@ -411,6 +413,7 @@ fn read_telemetry(synth: Res<Synth>, mut telemetry: ResMut<SynthTelemetry>) {
     let step = synth.params.current_step.load(Relaxed);
     telemetry.step_changed = step != telemetry.current_step;
     telemetry.current_step = step;
+    telemetry.bass_step = synth.params.bass_step.load(Relaxed);
     telemetry.drum_step = synth.params.drum_position.load(Relaxed);
     telemetry.active_voices = synth.params.active_voices.load(Relaxed);
     // `take_peak` resets the meter, so each frame reports the peak since the
