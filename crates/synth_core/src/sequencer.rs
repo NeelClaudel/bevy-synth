@@ -142,6 +142,28 @@ impl GenerativeSettings {
             accent_chance: 0.0,
         }
     }
+
+    /// The bass's generator.
+    ///
+    /// Key and scale come from the lead: a bass in a different key from the
+    /// melody is a bug, not a feature, and splitting them later is a one-line
+    /// change if it is ever wanted. Everything that actually distinguishes a
+    /// bass line — register, range, how busy it is, how far it leaps — is the
+    /// bass's own.
+    pub fn for_bass(p: &Params) -> Self {
+        Self {
+            root: p.gen_root,
+            scale: p.gen_scale,
+            octave: p.bass_gen_octave,
+            range: p.bass_gen_range,
+            density: p.bass_gen_density,
+            max_jump: p.bass_gen_max_jump,
+            chord_bias: p.bass_gen_chord_bias,
+            length: p.bass_seq_length,
+            slide_chance: p.bass_slide_chance,
+            accent_chance: p.bass_accent_chance,
+        }
+    }
 }
 
 /// The three per-line settings the sequencer used to read straight out of the
@@ -166,6 +188,18 @@ impl SeqSettings {
     pub fn from_params(p: &Params) -> Self {
         Self {
             length: p.seq_length,
+            swing: p.seq_swing,
+            gate: p.seq_gate,
+        }
+    }
+
+    /// The bass's sequencer settings.
+    ///
+    /// Its own length, the lead's groove: two lines that swing differently
+    /// against one clock is not an arrangement, it is a mistake.
+    pub fn for_bass(p: &Params) -> Self {
+        Self {
+            length: p.bass_seq_length,
             swing: p.seq_swing,
             gate: p.seq_gate,
         }

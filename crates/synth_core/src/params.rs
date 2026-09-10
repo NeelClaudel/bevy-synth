@@ -531,6 +531,17 @@ pub struct Params {
     pub synth_send: f32,
     pub comp_synth: CompressorParams,
     pub comp_master: CompressorParams,
+    /// Whether the bassline is audible. Off by default: adding an instrument
+    /// should never change what an existing patch sounds like.
+    pub bass_enabled: bool,
+    /// Level of the bass bus alone, under the master.
+    pub bass_gain: f32,
+    /// How much of the bass bus is sent to the effects return.
+    pub bass_send: f32,
+    /// The compressor inserted on the bass bus, before the send tap.
+    pub comp_bass: CompressorParams,
+    /// The bassline voice itself.
+    pub bass: BassParams,
     /// Level of the drum bus alone, applied where the rack is summed into the
     /// mix. Independent of `drum_level`, which trims the rack internally.
     pub drum_gain: f32,
@@ -626,6 +637,24 @@ pub struct Params {
     /// fifth). This is most of what separates "random notes in a scale" from
     /// something that sounds composed.
     pub gen_chord_bias: f32,
+
+    // --- Bass sequencer / generator ---
+    /// Loop length of the bass line, independent of `seq_length`.
+    pub bass_seq_length: usize,
+    /// The bass generator's register. Low, by default: that is the job.
+    pub bass_gen_octave: i32,
+    /// How many octaves the bass line may span.
+    pub bass_gen_range: u32,
+    /// How often a bass step has a note rather than a rest.
+    pub bass_gen_density: f32,
+    /// How far the bass line may leap, in scale degrees.
+    pub bass_gen_max_jump: f32,
+    /// How strongly bass downbeats land on root, third and fifth.
+    pub bass_gen_chord_bias: f32,
+    /// Chance a generated bass step is tied to the one before it.
+    pub bass_slide_chance: f32,
+    /// Chance a generated bass step is accented off the downbeat.
+    pub bass_accent_chance: f32,
 }
 
 impl Default for Params {
@@ -689,6 +718,11 @@ impl Default for Params {
             synth_send: 1.0,
             comp_synth: CompressorParams::default(),
             comp_master: CompressorParams::default(),
+            bass_enabled: false,
+            bass_gain: 1.0,
+            bass_send: 0.0,
+            comp_bass: CompressorParams::default(),
+            bass: BassParams::default(),
             drum_gain: 1.0,
             drive: 1.0,
 
@@ -734,6 +768,15 @@ impl Default for Params {
             gen_density: 0.75,
             gen_max_jump: 3.0,
             gen_chord_bias: 0.6,
+
+            bass_seq_length: 16,
+            bass_gen_octave: 2,
+            bass_gen_range: 1,
+            bass_gen_density: 0.85,
+            bass_gen_max_jump: 5.0,
+            bass_gen_chord_bias: 0.8,
+            bass_slide_chance: 0.25,
+            bass_accent_chance: 0.3,
         }
     }
 }
@@ -821,6 +864,38 @@ pub struct SharedParams {
     pub synth_send: AtomicF32,
     pub comp_synth: SharedCompressor,
     pub comp_master: SharedCompressor,
+
+    pub bass_enabled: AtomicBool32,
+    pub bass_gain: AtomicF32,
+    pub bass_send: AtomicF32,
+    pub comp_bass: SharedCompressor,
+    pub bass: SharedBass,
+
+    pub bass_seq_length: AtomicEnum,
+    pub bass_gen_octave: AtomicEnum,
+    pub bass_gen_range: AtomicEnum,
+    pub bass_gen_density: AtomicF32,
+    pub bass_gen_max_jump: AtomicF32,
+    pub bass_gen_chord_bias: AtomicF32,
+    pub bass_slide_chance: AtomicF32,
+    pub bass_accent_chance: AtomicF32,
+
+    /// The bass pattern, mirrored for the control side exactly as the lead's
+    /// is. Its own length, because a bass line is not the same length as the
+    /// melody unless somebody says so.
+    pub bass_pattern: [AtomicU32; crate::sequencer::MAX_STEPS],
+    pub bass_pattern_len: AtomicU32,
+    /// Seed for the bass generator, independent of the lead's.
+    pub bass_gen_seed: AtomicU64,
+    /// Bumped to ask the audio thread for a new bass line.
+    pub bass_regenerate: AtomicU32,
+
+    /// Bass sequencer step currently playing. Telemetry.
+    pub bass_step: AtomicU32,
+    /// Gain reduction the bass-bus compressor is applying, in positive dB.
+    /// Telemetry.
+    pub comp_bass_gr: AtomicF32,
+
     pub drum_gain: AtomicF32,
     pub drive: AtomicF32,
 
@@ -994,6 +1069,30 @@ impl SharedParams {
             synth_send: AtomicF32::new(p.synth_send),
             comp_synth: SharedCompressor::new(&p.comp_synth),
             comp_master: SharedCompressor::new(&p.comp_master),
+
+            bass_enabled: AtomicBool32::new(p.bass_enabled),
+            bass_gain: AtomicF32::new(p.bass_gain),
+            bass_send: AtomicF32::new(p.bass_send),
+            comp_bass: SharedCompressor::new(&p.comp_bass),
+            bass: SharedBass::new(&p.bass),
+
+            bass_seq_length: AtomicEnum::new(p.bass_seq_length as u32),
+            bass_gen_octave: AtomicEnum::new(p.bass_gen_octave as u32),
+            bass_gen_range: AtomicEnum::new(p.bass_gen_range),
+            bass_gen_density: AtomicF32::new(p.bass_gen_density),
+            bass_gen_max_jump: AtomicF32::new(p.bass_gen_max_jump),
+            bass_gen_chord_bias: AtomicF32::new(p.bass_gen_chord_bias),
+            bass_slide_chance: AtomicF32::new(p.bass_slide_chance),
+            bass_accent_chance: AtomicF32::new(p.bass_accent_chance),
+
+            bass_pattern: core::array::from_fn(|_| AtomicU32::new(0)),
+            bass_pattern_len: AtomicU32::new(p.bass_seq_length as u32),
+            bass_gen_seed: AtomicU64::new(0x5EED_1234_ABCD_0B45),
+            bass_regenerate: AtomicU32::new(0),
+
+            bass_step: AtomicU32::new(0),
+            comp_bass_gr: AtomicF32::new(0.0),
+
             drum_gain: AtomicF32::new(p.drum_gain),
             drive: AtomicF32::new(p.drive),
 
@@ -1122,6 +1221,23 @@ impl SharedParams {
             synth_send: clamp01(self.synth_send.get()),
             comp_synth: self.comp_synth.snapshot(),
             comp_master: self.comp_master.snapshot(),
+
+            bass_enabled: self.bass_enabled.get(),
+            bass_gain: sane(self.bass_gain.get(), 1.0).clamp(0.0, 2.0),
+            bass_send: clamp01(self.bass_send.get()),
+            comp_bass: self.comp_bass.snapshot(),
+            bass: self.bass.snapshot(),
+
+            bass_seq_length: (self.bass_seq_length.get() as usize)
+                .clamp(1, crate::sequencer::MAX_STEPS),
+            bass_gen_octave: (self.bass_gen_octave.get() as i32).clamp(0, 7),
+            bass_gen_range: self.bass_gen_range.get().clamp(1, 4),
+            bass_gen_density: clamp01(self.bass_gen_density.get()),
+            bass_gen_max_jump: sane(self.bass_gen_max_jump.get(), 5.0).clamp(1.0, 12.0),
+            bass_gen_chord_bias: clamp01(self.bass_gen_chord_bias.get()),
+            bass_slide_chance: clamp01(self.bass_slide_chance.get()),
+            bass_accent_chance: clamp01(self.bass_accent_chance.get()),
+
             drum_gain: self.drum_gain.get().clamp(0.0, 2.0),
             drive: self.drive.get().clamp(0.1, 20.0),
 
@@ -1229,6 +1345,22 @@ impl SharedParams {
         self.synth_send.set(p.synth_send);
         self.comp_synth.apply(&p.comp_synth);
         self.comp_master.apply(&p.comp_master);
+
+        self.bass_enabled.set(p.bass_enabled);
+        self.bass_gain.set(p.bass_gain);
+        self.bass_send.set(p.bass_send);
+        self.comp_bass.apply(&p.comp_bass);
+        self.bass.apply(&p.bass);
+
+        self.bass_seq_length.set(p.bass_seq_length as u32);
+        self.bass_gen_octave.set(p.bass_gen_octave as u32);
+        self.bass_gen_range.set(p.bass_gen_range);
+        self.bass_gen_density.set(p.bass_gen_density);
+        self.bass_gen_max_jump.set(p.bass_gen_max_jump);
+        self.bass_gen_chord_bias.set(p.bass_gen_chord_bias);
+        self.bass_slide_chance.set(p.bass_slide_chance);
+        self.bass_accent_chance.set(p.bass_accent_chance);
+
         self.drum_gain.set(p.drum_gain);
         self.drive.set(p.drive);
 
@@ -1308,6 +1440,41 @@ impl SharedParams {
         let len = (self.pattern_len.load(REL) as usize).clamp(1, crate::sequencer::MAX_STEPS);
         let steps = core::array::from_fn(|i| self.read_step(i));
         crate::sequencer::Pattern::new(steps, len)
+    }
+
+    /// Copies one bass step into the mirror. Same contract as
+    /// [`SharedParams::publish_step`].
+    pub fn publish_bass_step(&self, index: usize, step: &crate::sequencer::Step) {
+        if let Some(slot) = self.bass_pattern.get(index) {
+            slot.store(pack_step(step), REL);
+        }
+    }
+
+    pub fn publish_bass_len(&self, len: usize) {
+        self.bass_pattern_len.store(len as u32, REL);
+    }
+
+    pub fn read_bass_step(&self, index: usize) -> crate::sequencer::Step {
+        match self.bass_pattern.get(index) {
+            Some(slot) => unpack_step(slot.load(REL)),
+            None => crate::sequencer::Step::default(),
+        }
+    }
+
+    /// The bass pattern as the audio thread last published it.
+    pub fn read_bass_pattern(&self) -> crate::sequencer::Pattern {
+        let mut steps = [crate::sequencer::Step::default(); crate::sequencer::MAX_STEPS];
+        for (index, step) in steps.iter_mut().enumerate() {
+            *step = self.read_bass_step(index);
+        }
+        let len = (self.bass_pattern_len.load(REL) as usize)
+            .clamp(1, crate::sequencer::MAX_STEPS);
+        crate::sequencer::Pattern::new(steps, len)
+    }
+
+    /// Asks the audio thread for a new bass line, without needing a queue slot.
+    pub fn regenerate_bass(&self) {
+        self.bass_regenerate.fetch_add(1, REL);
     }
 
     /// Publishes one column of the grid. Called by the audio thread.
@@ -1833,5 +2000,87 @@ mod tests {
         let other = BassParams::default();
         shared.apply(&other);
         assert_eq!(shared.snapshot(), other);
+    }
+
+    #[test]
+    fn the_bass_is_off_by_default_and_round_trips() {
+        let p = Params::default();
+        assert!(!p.bass_enabled, "the bass must be silent until switched on");
+        assert_eq!(p.bass_send, 0.0, "a new send starts closed");
+
+        let shared = SharedParams::from_params(&p);
+        let back = shared.snapshot();
+        assert!(!back.bass_enabled);
+        assert_eq!(back.bass_gain, p.bass_gain);
+        assert_eq!(back.bass_seq_length, p.bass_seq_length);
+        assert_eq!(back.bass, p.bass);
+
+        let changed = Params {
+            bass_enabled: true,
+            bass_gain: 0.6,
+            bass_send: 0.4,
+            bass_seq_length: 8,
+            bass_gen_octave: 1,
+            bass_slide_chance: 0.75,
+            ..Params::default()
+        };
+        shared.apply(&changed);
+        let out = shared.snapshot();
+        assert!(out.bass_enabled);
+        assert_eq!(out.bass_gain, 0.6);
+        assert_eq!(out.bass_send, 0.4);
+        assert_eq!(out.bass_seq_length, 8);
+        assert_eq!(out.bass_gen_octave, 1);
+        assert_eq!(out.bass_slide_chance, 0.75);
+    }
+
+    #[test]
+    fn the_bass_pattern_mirror_is_separate_from_the_lead_s() {
+        let shared = SharedParams::from_params(&Params::default());
+        let lead = crate::sequencer::Step {
+            active: true, note: 72, velocity: 1.0, accent: false, slide: false,
+        };
+        let bass = crate::sequencer::Step {
+            active: true, note: 36, velocity: 0.6, accent: true, slide: true,
+        };
+        shared.publish_step(3, &lead);
+        shared.publish_bass_step(3, &bass);
+        shared.publish_bass_len(8);
+
+        assert_eq!(shared.read_step(3).note, 72);
+        assert_eq!(shared.read_bass_step(3).note, 36);
+        assert!(shared.read_bass_step(3).slide);
+        assert_eq!(shared.read_bass_pattern().len(), 8);
+        assert_eq!(shared.read_pattern().len(), Params::default().seq_length);
+    }
+
+    #[test]
+    fn the_bass_generator_reads_its_own_knobs_and_the_lead_s_key() {
+        use crate::sequencer::{GenerativeSettings, SeqSettings};
+        let p = Params {
+            gen_root: 7,
+            gen_octave: 5,
+            gen_density: 0.2,
+            seq_length: 32,
+            bass_gen_octave: 1,
+            bass_gen_density: 0.95,
+            bass_seq_length: 8,
+            bass_slide_chance: 0.5,
+            bass_accent_chance: 0.4,
+            ..Params::default()
+        };
+        let g = GenerativeSettings::for_bass(&p);
+        assert_eq!(g.root, 7, "key is shared with the lead");
+        assert_eq!(g.scale, p.gen_scale, "so is the scale");
+        assert_eq!(g.octave, 1, "register is the bass's own");
+        assert_eq!(g.density, 0.95);
+        assert_eq!(g.length, 8);
+        assert_eq!(g.slide_chance, 0.5);
+        assert_eq!(g.accent_chance, 0.4);
+
+        let s = SeqSettings::for_bass(&p);
+        assert_eq!(s.length, 8, "the bass owns its loop length");
+        assert_eq!(s.swing, p.seq_swing, "and shares the groove");
+        assert_eq!(s.gate, p.seq_gate);
     }
 }
