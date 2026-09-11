@@ -85,7 +85,7 @@ pub(crate) fn mixer(ui: &mut Ui, synth: &Synth, telemetry: &SynthTelemetry, stat
                         .size(36.0),
                     &p.bass_send,
                 )
-                .on_hover_text("how much of the bass reaches the effects return");
+                .on_hover_text("how much of the bass bus reaches delay and reverb");
             });
 
             ui.separator();

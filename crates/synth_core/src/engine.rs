@@ -98,6 +98,7 @@ pub struct Engine {
 
     last_voice_mode: VoiceMode,
     last_melody_enabled: bool,
+    last_bass_enabled: bool,
     last_regenerate: u32,
     last_bass_regenerate: u32,
     last_pattern_request: u32,
@@ -166,6 +167,7 @@ impl Engine {
             bass_block: vec![0.0; BLOCK],
             last_voice_mode: snapshot.voice_mode,
             last_melody_enabled: snapshot.melody_enabled,
+            last_bass_enabled: snapshot.bass_enabled,
             last_regenerate: 0,
             last_bass_regenerate: 0,
             last_pattern_request: 0,
@@ -291,6 +293,16 @@ impl Engine {
                 self.all_notes_off(false);
             }
             self.last_melody_enabled = params.melody_enabled;
+        }
+
+        // Same reasoning as melody, above: without this the bass would keep
+        // ringing on whatever note it was gated on until its envelope decayed
+        // out on its own, well after the mute was supposed to be silent.
+        if params.bass_enabled != self.last_bass_enabled {
+            if !params.bass_enabled {
+                self.bass.silence();
+            }
+            self.last_bass_enabled = params.bass_enabled;
         }
 
         self.drain_events(&params);
@@ -2663,6 +2675,46 @@ mod tests {
         shared.seq_playing.set(false);
         let after = render(&mut engine, 200);
         assert_silent(&after, "bass note hung after seq_playing went false");
+    }
+
+    /// `render_chunk`'s own `if params.bass_enabled` gate already keeps a
+    /// disabled bass out of the mix — that half of the bug is silent either
+    /// way and proves nothing. The real gap: while disabled, the sequencer
+    /// still steps (`bass_seq.advance` runs unconditionally) but its note-off
+    /// is dropped along with note-on, so `self.bass`'s gate is never told to
+    /// let go. Re-enable with no fresh note-on due yet and, without a
+    /// counterpart to `last_melody_enabled`, the old note's envelope resumes
+    /// decaying from wherever it was frozen instead of staying silent.
+    #[test]
+    fn re_enabling_bass_does_not_resume_an_old_note() {
+        let p = Params {
+            bass_enabled: true,
+            melody_enabled: false,
+            drum_enabled: false,
+            seq_gate: 2.0,
+            seq_playing: true,
+            ..Params::default()
+        };
+        let shared = std::sync::Arc::new(SharedParams::from_params(&p));
+        let (_tx, rx) = crate::event::channel(64);
+        let mut engine = Engine::new(48_000.0, shared.clone(), rx);
+        shared.tempo.set(140.0);
+        shared.bass_gen_density.set(1.0);
+
+        let gated = render(&mut engine, 48_000);
+        assert!(peak(&gated) > SILENT, "bass never gated a note");
+
+        // A block has to actually run while disabled, or `begin_block` never
+        // observes the falling edge at all: two `.set()` calls with no render
+        // between them collapse to a no-op from its point of view, since it
+        // only ever reads the value once per block.
+        shared.bass_enabled.set(false);
+        let muted = render(&mut engine, BLOCK);
+        assert_silent(&muted, "bass audible while disabled");
+
+        shared.bass_enabled.set(true);
+        let after = render(&mut engine, 200);
+        assert_silent(&after, "an old bass note resumed on re-enable");
     }
 
     #[test]
