@@ -598,6 +598,24 @@ impl Engine {
                             self.note_on(note, velocity, params);
                         }
                     }
+                    // Same tick, same gating shape as the lead just above:
+                    // `render_chunk` advances all three sequencers from one
+                    // clock, so the tick path has to touch all three too, or
+                    // switching to an external clock silently drops whichever
+                    // one this arm forgot.
+                    let bass_seq = self.bass_seq.on_midi_tick(
+                        ticked,
+                        self.clock.view(),
+                        &SeqSettings::for_bass(params),
+                    );
+                    if params.bass_enabled {
+                        if bass_seq.note_off.is_some() && !bass_seq.slide {
+                            self.bass.note_off();
+                        }
+                        if let Some((note, _velocity)) = bass_seq.note_on {
+                            self.bass.note_on(note, bass_seq.accent, bass_seq.slide);
+                        }
+                    }
                     self.drums.on_tick(ticked, self.clock.view(), params);
                 }
                 Event::ClockStart => {
@@ -1501,6 +1519,33 @@ mod tests {
             out.extend(render(&mut e, samples_per_tick as usize));
         }
         assert_silent(&out, "the melody played while muted under an external clock");
+    }
+
+    /// The bug this guards against: `render_chunk` advances the bass
+    /// alongside the lead and the drums, but the `ClockTick` arm only ever
+    /// advanced the lead and the drums, so switching to an external MIDI
+    /// clock silenced the bass with nothing in the golden vector or any other
+    /// test able to notice, since the golden vector never runs the transport.
+    #[test]
+    fn external_clock_ticks_drive_the_bass() {
+        let (mut e, tx, params) = engine();
+        params.clock_source.set(ClockSource::ExternalMidi as u32);
+        params.bass_enabled.set(true);
+        params.bass_send.set(0.0);
+        // Isolate the bass: the lead's tick path already works, and left
+        // enabled it would make this test pass on the lead's sound alone.
+        params.melody_enabled.set(false);
+        tx.push(Event::ClockStart);
+
+        // Same drive as `external_clock_ticks_drive_the_sequencer`.
+        let samples_per_tick = 48000.0 * 60.0 / (120.0 * 24.0);
+        let mut out = Vec::new();
+        for _ in 0..96 {
+            tx.push(Event::ClockTick);
+            out.extend(render(&mut e, samples_per_tick as usize));
+        }
+        let peak = peak(&out);
+        assert!(peak > 0.0, "external clock produced no bass: {peak}");
     }
 
     #[test]
