@@ -2522,60 +2522,57 @@ mod tests {
         );
     }
 
+    /// Two fresh engines, not one measured twice: the old version drove the
+    /// kick pattern and the hat pattern back-to-back on the *same* engine, so
+    /// the second reading was confounded by the compressor's gain reduction
+    /// still releasing from the first window, not by which pad fired.
+    /// Mutating this test's own `sidechain: SidechainSource::Kick` to `Off`
+    /// proved the confound: the old shape stayed green even with the
+    /// sidechain wire cut.
     #[test]
     fn comp_bass_ducks_on_the_kick_and_not_on_other_pads() {
         // The tap the drum rack already publishes, reused: bass ducking under
         // the kick falls out with no new machinery, and this is the test that
         // says so.
-        let ducking = Params {
-            bass_enabled: true,
-            drum_enabled: true,
-            seq_playing: true,
-            comp_bass: CompressorParams {
-                on: true,
-                threshold_db: -30.0,
-                ratio: 10.0,
-                sidechain: SidechainSource::Kick,
-                ..CompressorParams::default()
-            },
-            ..Params::default()
+        let arm = |p: &SharedParams| {
+            p.bass_enabled.set(true);
+            p.drum_enabled.set(true);
+            p.seq_playing.set(true);
+            p.drum_gain.set(0.0); // Hear the ducking, not the kick.
+            p.comp_bass.on.set(true);
+            p.comp_bass.threshold_db.set(-30.0);
+            p.comp_bass.ratio.set(10.0);
+            p.comp_bass.attack_ms.set(1.0);
+            p.comp_bass.release_ms.set(200.0);
+            p.comp_bass.sidechain.set(SidechainSource::Kick as u32);
         };
-        let shared = std::sync::Arc::new(SharedParams::from_params(&ducking));
-        let (tx, rx) = channel(256);
-        let mut engine = Engine::new(48_000.0, shared.clone(), rx);
-
         // Pad 0 is the kick: `rack.rs` writes `out.kick` from pad 0, and
-        // `sidechain(SidechainSource::Kick, ..)` copies that tap. `Cell` is
+        // `sidechain(SidechainSource::Kick, ..)` copies that tap. Pad 2 is a
+        // hat in the default rack; any pad but 0 proves the point. `Cell` is
         // already imported into this `mod tests` as `crate::drums::Cell`.
-        for step in (0..16u8).step_by(4) {
-            assert!(tx.push(Event::SetDrumCell {
-                step,
-                pad: 0,
-                cell: Cell { active: true, velocity: 1.0 },
-            }));
-        }
-        engine_peak(&mut engine, 1_200);
-        let with_kick = shared.comp_bass_gr.get();
+        let gr_for_pad = |pad: u8| -> f32 {
+            let shared = std::sync::Arc::new(SharedParams::default());
+            arm(&shared);
+            let (tx, rx) = channel(256);
+            let mut engine = Engine::new(48_000.0, shared.clone(), rx);
+            for step in (0..16u8).step_by(4) {
+                assert!(tx.push(Event::SetDrumCell {
+                    step,
+                    pad,
+                    cell: Cell { active: true, velocity: 1.0 },
+                }));
+            }
+            engine_peak(&mut engine, 1_200);
+            shared.comp_bass_gr.get()
+        };
+        let with_kick = gr_for_pad(0);
+        let without_kick = gr_for_pad(2);
 
-        // Now the same pattern on a pad that is not the kick. Pad 2 is a hat
-        // in the default rack; any pad but 0 proves the point.
-        for step in (0..16u8).step_by(4) {
-            assert!(tx.push(Event::SetDrumCell {
-                step,
-                pad: 0,
-                cell: Cell::default(),
-            }));
-            assert!(tx.push(Event::SetDrumCell {
-                step,
-                pad: 2,
-                cell: Cell { active: true, velocity: 1.0 },
-            }));
-        }
-        engine_peak(&mut engine, 1_200);
-        let without_kick = shared.comp_bass_gr.get();
-
+        // Measured: with_kick ~= 12.3, without_kick == 0.0 (pad 2 never
+        // triggers the kick tap, so the compressor never engages at all).
+        // A margin of 2.0 sits nowhere near either measurement's noise floor.
         assert!(
-            with_kick > without_kick + 0.5,
+            with_kick > without_kick + 2.0,
             "the kick should duck the bass and another pad should not: \
              {with_kick} vs {without_kick}"
         );
