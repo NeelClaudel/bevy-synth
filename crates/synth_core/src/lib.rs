@@ -57,7 +57,7 @@ pub use params::{
 };
 pub use rng::Rng;
 pub use scale::{Scale, ScaleQuantizer};
-pub use sequencer::{GenerativeSettings, Pattern, Sequencer, Step};
+pub use sequencer::{GenerativeSettings, Pattern, SeqSettings, Sequencer, Step};
 
 /// Control-rate block size, in samples.
 ///

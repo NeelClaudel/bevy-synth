@@ -175,7 +175,8 @@ impl BassVoice {
             release: decay,
         });
 
-        self.set_glide(p.slide_time);
+        let slide_time = sane_or(p.slide_time, 0.06).clamp(0.01, 0.5);
+        self.set_glide(slide_time);
 
         for sample in out.iter_mut() {
             // Pitch first: a slide moves it every sample.

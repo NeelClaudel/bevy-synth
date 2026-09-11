@@ -534,7 +534,7 @@ impl Sequencer {
         // A tie needs the note before it still sounding when it lands, or the
         // glide has nothing to glide from. Look one step ahead: hold this note
         // through the whole step rather than releasing it at the gate. Two
-        // steps rather than one, so the maximum swing delay of 0.6 is covered
+        // steps rather than one, so the maximum swing delay of 0.75 is covered
         // and the note still releases if the tie is edited away mid-flight.
         let following = self.pattern[(self.position + 1) % self.length];
         let hold = following.active && following.slide;
@@ -613,6 +613,8 @@ mod tests {
     /// line, so that hoisting the clock does not turn into a rewrite of every
     /// test.
     fn block(s: &mut Sequencer, c: &mut Clock, settings: &SeqSettings) -> SeqOutput {
+        // Tempo/steps-per-beat are fixed to the default here; callers cannot
+        // change this helper's transport by mutating their own `Params`.
         let p = Params::default();
         if p.clock_source == ClockSource::Internal {
             c.set_tempo(p.tempo, p.steps_per_beat);
@@ -786,8 +788,6 @@ mod tests {
         s.regenerate(&gen);
 
         let mut p = Params::default();
-        p.tempo = 120.0;
-        p.steps_per_beat = 4.0;
         p.seq_gate = 0.5;
         let settings = SeqSettings::from_params(&p);
         let mut c = Clock::new(48000.0);
@@ -835,8 +835,6 @@ mod tests {
         s.regenerate(&gen);
 
         let mut p = Params::default();
-        p.tempo = 120.0;
-        p.steps_per_beat = 4.0;
         p.seq_swing = 0.3;
         let settings = SeqSettings::from_params(&p);
         let mut c = Clock::new(48000.0);
@@ -904,9 +902,7 @@ mod tests {
         s.regenerate(&settings());
         let before = s.pattern().to_vec();
 
-        let mut p = Params::default();
-        p.tempo = 120.0;
-        p.steps_per_beat = 4.0;
+        let p = Params::default();
         let settings = SeqSettings::from_params(&p);
         let mut c = Clock::new(48000.0);
         c.start();
@@ -953,9 +949,7 @@ mod tests {
         let mut s = Sequencer::new(8);
         s.regenerate(&settings());
 
-        let mut p = Params::default();
-        p.tempo = 120.0;
-        p.steps_per_beat = 4.0;
+        let p = Params::default();
         let settings = SeqSettings::from_params(&p);
         let mut c = Clock::new(48000.0);
         c.start();
